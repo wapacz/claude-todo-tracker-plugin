@@ -200,7 +200,7 @@ const PARENT_WITH_SUBTASKS = {
   ],
 } as const
 
-test('subtasks draw indented and the parent runs while any subtask runs', async ($, on) => {
+test('subtasks draw indented and a partly done parent gets a yellow half-filled circle', async ($, on) => {
   mockSession(on)
   mock.store(on)
   const answer = await $.tool.call({ tool: SET_TODOS, todos: [PARENT_WITH_SUBTASKS] })
@@ -211,7 +211,7 @@ test('subtasks draw indented and the parent runs while any subtask runs', async 
     expect(answer.result).toBe('Sidebar updated: 0/1 done, 1 in progress.')
     expect(await drawnRows(ui)).toEqual([
       '0/1 done, 1 in progress',
-      '○ Updating documentation…',
+      '◐ Updating documentation…',
       '    ✓ Wrote docs/oauth.md',
       '    ○ Adding README section…',
       '    ○ Link from CHANGELOG',
@@ -375,4 +375,32 @@ test('rows are drawn without gray dimming, only the activity bar is dim', async 
   const texts = await ui.findAll({ type: 'Text' })
   const dimmed = texts.filter(element => element.props.dimColor === true).map(element => element.text)
   expect(dimmed).toEqual(['│'])
+})
+
+test('the half-filled parent mark is yellow and a single-step todo keeps the plain circle', async ($, on) => {
+  mockSession(on)
+  mock.store(on)
+  await $.tool.call({ tool: SET_TODOS, todos: [PARENT_WITH_SUBTASKS, TODOS[1]] })
+  const ui = await mountSidebar($, 'terminal')
+
+  const marks = (await ui.findAll({ type: 'Text' })).filter(element => ['◐', '○', '✓'].includes(element.text))
+  expect(marks[0]).toMatchObject({ text: '◐', props: { color: 'yellow' } })
+  expect(marks[4]).toMatchObject({ text: '○' })
+  expect(marks[4]?.props.color).toBeUndefined()
+})
+
+test('a parent with one subtask done and the rest pending is half-filled, not running', async ($, on) => {
+  mockSession(on)
+  mock.store(on)
+  const oneDone = {
+    ...PARENT_WITH_SUBTASKS,
+    subtasks: PARENT_WITH_SUBTASKS.subtasks.map((step, index) => ({
+      ...step,
+      status: index === 0 ? ('completed' as const) : ('pending' as const),
+    })),
+  }
+  await $.tool.call({ tool: SET_TODOS, todos: [oneDone] })
+  const ui = await mountSidebar($, 'terminal')
+
+  expect((await drawnRows(ui))[1]).toBe('◐ Updating documentation…')
 })

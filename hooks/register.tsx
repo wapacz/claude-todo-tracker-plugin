@@ -130,12 +130,42 @@ function parseTodos(value: unknown): ParsedTodos {
   return { success: true, todos: parsed.filter((item): item is TodoItem => typeof item !== 'string') }
 }
 
+type StepMark = TodoStatus | 'partial'
+
+function hasPartlyDoneSubtasks(item: TodoItem): boolean {
+  const subtasks = item.subtasks ?? []
+  const hasStarted = subtasks.some(step => step.status !== 'pending')
+  const isAllDone = subtasks.every(step => step.status === 'completed')
+  return subtasks.length > 0 && hasStarted && !isAllDone
+}
+
 function effectiveStatus(item: TodoItem): TodoStatus {
   const subtasks = item.subtasks ?? []
   if (subtasks.length === 0) return item.status
   if (subtasks.every(step => step.status === 'completed')) return 'completed'
-  const hasStarted = subtasks.some(step => step.status !== 'pending')
-  return hasStarted ? 'in_progress' : item.status
+  return hasPartlyDoneSubtasks(item) ? 'in_progress' : item.status
+}
+
+function markOf(item: TodoItem): StepMark {
+  return hasPartlyDoneSubtasks(item) ? 'partial' : effectiveStatus(item)
+}
+
+const MARK_GLYPH: Record<StepMark, string> = {
+  completed: '✓',
+  partial: '◐',
+  in_progress: '○',
+  pending: '○',
+}
+
+const MARK_COLOR: Record<StepMark, string | undefined> = {
+  completed: 'green',
+  partial: 'yellow',
+  in_progress: undefined,
+  pending: undefined,
+}
+
+function isRunning(mark: StepMark): boolean {
+  return mark === 'in_progress' || mark === 'partial'
 }
 
 function parseTitle(value: unknown): string | null {
@@ -306,14 +336,10 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE_ID }, async ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
-    const drawStep = (step: Step, status: TodoStatus, indent: number) => (
+    const drawStep = (step: Step, mark: StepMark, indent: number) => (
       <Box flexDirection="row" gap={1} paddingLeft={indent}>
-        {status === 'completed' && <Text color="green">✓</Text>}
-        {status === 'in_progress' && <Text>○</Text>}
-        {status === 'pending' && <Text>○</Text>}
-        <Text wrap="truncate-end">
-          {status === 'in_progress' ? `${step.activeForm}…` : step.content}
-        </Text>
+        <Text color={MARK_COLOR[mark]}>{MARK_GLYPH[mark]}</Text>
+        <Text wrap="truncate-end">{isRunning(mark) ? `${step.activeForm}…` : step.content}</Text>
       </Box>
     )
     const [list, heading, activity] = await Promise.all([read($, todos), read($, title), read($, toolActivity)])
@@ -325,7 +351,7 @@ export const register: Register = on => {
         {list.length > 0 && (
           <Box flexDirection="column">
             {list.flatMap(item => [
-              drawStep(item, effectiveStatus(item), 0),
+              drawStep(item, markOf(item), 0),
               ...(item.subtasks ?? []).map(step => drawStep(step, step.status, SUBTASK_INDENT)),
             ])}
           </Box>

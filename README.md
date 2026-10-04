@@ -23,6 +23,9 @@ Implement OAuth scopes
 
 ## What it does
 
+- Keeps a three-bullet summary of the session at the top. A cheap model (`haiku` by default) is
+  asked once every six of your prompts whether the bullets still fit; if not it adds one bullet and
+  the oldest drops. Set `summaryEveryPrompts` to 0 in the plugin config to turn it off.
 - Shows the title of the current task, every step with a check mark, and the running step in its
   active form. One level of subtasks is supported; a parent is shown running while any subtask runs
   and done once all are done.

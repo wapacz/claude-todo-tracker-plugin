@@ -15,6 +15,18 @@
       "description": "Show the tool calls made while the running step is worked on (Read, Edit, Run) under the todo list",
       "default": false,
       "title": "Show activity log"
+    },
+    "summaryEveryPrompts": {
+      "type": "number",
+      "title": "Summary refresh cadence",
+      "description": "Ask the summary model again after this many of your prompts; 0 turns the summary off",
+      "default": 6
+    },
+    "summaryModel": {
+      "type": "string",
+      "title": "Summary model",
+      "description": "Model alias or id used for the session summary (cheap is fine)",
+      "default": "haiku"
     }
   }
 }

@@ -18,6 +18,12 @@ export type ToolActivity = {
   isDone: boolean
 }
 
+export type SessionSummary = {
+  bullets: string[]
+  coveredMessages: number
+  checkedAtTurn: number
+}
+
 export type AgentRow = {
   id: string
   label: string
@@ -34,6 +40,7 @@ declare module 'claude-code' {
       toolActivity: ToolActivity[]
       agents: AgentRow[]
       expandedParents: string[]
+      summary: SessionSummary
     }
   }
 }

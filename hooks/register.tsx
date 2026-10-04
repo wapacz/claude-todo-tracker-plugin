@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { AgentInfo, EngineInterface, Register, ToolCallInput, ToolCallResult } from 'claude-code'
 
-import type { AgentRow, Step, TodoItem, TodoStatus, ToolActivity } from '../types'
+import type { AgentRow, SessionSummary, Step, TodoItem, TodoStatus, ToolActivity } from '../types'
 
 const PANE_ID = 'todo-sidebar'
 const PANE_TITLE = 'Todos'
@@ -14,12 +14,19 @@ const SUBTASK_INDENT = 4
 const KEPT_SESSIONS = 20
 const ENDED_AGENT_TURNS_SHOWN = 1
 const PANE_FIXED_ROWS = 4
+const SUMMARY_BULLETS = 3
+const SUMMARY_MESSAGE_CHARS = 600
+const SUMMARY_PROMPT_CHARS = 12000
+const SUMMARY_TIMEOUT_MS = 10000
+const SUMMARY_SAME = 'SAME'
 
 const todos = atom({ plugin: 'todo-sidebar', key: 'todos' } as const, [])
 const title = atom({ plugin: 'todo-sidebar', key: 'title' } as const, null)
 const toolActivity = atom({ plugin: 'todo-sidebar', key: 'toolActivity' } as const, [])
 const agents = atom({ plugin: 'todo-sidebar', key: 'agents' } as const, [])
 const expandedParents = atom({ plugin: 'todo-sidebar', key: 'expandedParents' } as const, [])
+const EMPTY_SUMMARY: SessionSummary = { bullets: [], coveredMessages: 0, checkedAtTurn: 0 }
+const summary = atom({ plugin: 'todo-sidebar', key: 'summary' } as const, EMPTY_SUMMARY)
 
 const STATUSES: readonly TodoStatus[] = ['pending', 'in_progress', 'completed']
 
@@ -59,7 +66,7 @@ const STEP_PROPERTIES = {
   content: {
     type: 'string',
     description:
-      'An outcome in the user\'s words, past tense once done, e.g. "Added OAuth provider". ' +
+      'Plain text, no markdown (the pane draws it literally). An outcome in the user\'s words, past tense once done, e.g. "Added OAuth provider". ' +
       'A step only the user can take is an instruction to them, e.g. "Approve module 2", with forUser true. Never agent mechanics like "Ran tests".',
   },
   status: { type: 'string', enum: STATUSES },
@@ -100,6 +107,17 @@ const SET_TODOS_SCHEMA = {
 
 type ParsedTodos = { success: true; todos: TodoItem[] } | { success: false; error: string }
 
+// The pane draws plain Text, so markdown an agent slips into a row would show as literal asterisks.
+function plainText(text: string): string {
+  return text
+    .replace(/`([^`]*)`/g, '$1')
+    .replace(/(\*\*|__)(.+?)\1/g, '$2')
+    .replace(/(^|[\s(])[*_](\S(?:.*?\S)?)[*_](?=$|[\s).,;:!?])/g, '$1$2')
+    .replace(/^#{1,6}\s+/, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
 function isTodoStatus(value: unknown): value is TodoStatus {
   return typeof value === 'string' && STATUSES.includes(value as TodoStatus)
 }
@@ -112,9 +130,9 @@ function parseStep(value: unknown, path: string): Step | string {
   if (forUser !== undefined && typeof forUser !== 'boolean') return `${path}.forUser must be true or false`
 
   return {
-    content,
+    content: plainText(content),
     status,
-    activeForm: typeof activeForm === 'string' ? activeForm : content,
+    activeForm: plainText(typeof activeForm === 'string' ? activeForm : content),
     isForUser: forUser === true,
   }
 }
@@ -265,7 +283,9 @@ function agentStatusNote(row: AgentRow): string {
 }
 
 function parseTitle(value: unknown): string | null {
-  return typeof value === 'string' && value.trim() !== '' ? value.trim() : null
+  if (typeof value !== 'string') return null
+  const text = plainText(value)
+  return text === '' ? null : text
 }
 
 function runningStepOf(list: readonly TodoItem[]): string | null {
@@ -275,7 +295,45 @@ function runningStepOf(list: readonly TodoItem[]): string | null {
   return child === undefined ? parent.content : `${parent.content} > ${child.content}`
 }
 
-type SavedList = { title: string | null; todos: TodoItem[] }
+type SavedList = { title: string | null; todos: TodoItem[]; summary?: SessionSummary }
+
+type SummaryPolicy = { everyPrompts: number; model: string }
+
+const SUMMARY_SYSTEM =
+  'You keep a running summary of a coding session for the person driving it, shown in a sidebar. ' +
+  'You get the current bullets and the messages since the last check. ' +
+  `Answer exactly ${SUMMARY_SAME} if the bullets still describe what the session is about. ` +
+  'Otherwise answer ONE new bullet, at most 12 words, past tense, from the person\'s point of view, ' +
+  'no leading dash or bullet character, no quotes. Never rewrite the old bullets.'
+
+function parseSummary(value: unknown): SessionSummary {
+  if (typeof value !== 'object' || value === null) return EMPTY_SUMMARY
+  const { bullets, coveredMessages, checkedAtTurn } = value as Record<string, unknown>
+  const isValid = Array.isArray(bullets) && bullets.every(b => typeof b === 'string')
+    && typeof coveredMessages === 'number' && typeof checkedAtTurn === 'number'
+  return isValid ? { bullets: bullets as string[], coveredMessages, checkedAtTurn } : EMPTY_SUMMARY
+}
+
+function summaryPrompt(bullets: readonly string[], messages: readonly { role: string; text: string }[]): string {
+  const current = bullets.length === 0 ? '(none yet)' : bullets.map(b => `- ${b}`).join('\n')
+  const lines: string[] = []
+  let used = 0
+  for (const message of messages) {
+    const text = message.text.replace(/\s+/g, ' ').trim().slice(0, SUMMARY_MESSAGE_CHARS)
+    if (text === '') continue
+    const line = `${message.role}: ${text}`
+    if (used + line.length > SUMMARY_PROMPT_CHARS) break
+    lines.push(line)
+    used += line.length
+  }
+  return `Current bullets:\n${current}\n\nNew messages:\n${lines.join('\n')}`
+}
+
+function appendBullet(bullets: readonly string[], reply: string): string[] {
+  const bullet = plainText(reply).replace(/^[-•·*]\s+/, '').replace(/^"|"$/g, '').trim()
+  if (bullet === '' || bullet.toUpperCase() === SUMMARY_SAME) return [...bullets]
+  return [...bullets, bullet].slice(-SUMMARY_BULLETS)
+}
 
 function savedStepToInput(value: unknown): unknown {
   if (typeof value !== 'object' || value === null) return value
@@ -289,10 +347,11 @@ function savedStepToInput(value: unknown): unknown {
 
 function parseSaved(value: unknown): SavedList | null {
   if (typeof value !== 'object' || value === null) return null
-  const { title: savedTitle, todos: savedTodos } = value as Record<string, unknown>
+  const { title: savedTitle, todos: savedTodos, summary: savedSummary } = value as Record<string, unknown>
   if (!Array.isArray(savedTodos)) return null
   const parsed = parseTodos(savedTodos.map(savedStepToInput))
-  return parsed.success ? { title: parseTitle(savedTitle), todos: parsed.todos } : null
+  if (!parsed.success) return null
+  return { title: parseTitle(savedTitle), todos: parsed.todos, summary: parseSummary(savedSummary) }
 }
 
 function completedCopy(steps: readonly Step[]): Step[] {
@@ -362,8 +421,8 @@ async function storeKeyOf($: EngineInterface): Promise<string> {
 }
 
 async function persist($: EngineInterface): Promise<void> {
-  const [heading, list] = await Promise.all([read($, title), read($, todos)])
-  const saved: SavedList = { title: heading, todos: list }
+  const [heading, list, digest] = await Promise.all([read($, title), read($, todos), read($, summary)])
+  const saved: SavedList = { title: heading, todos: list, summary: digest }
   await $.store.set(await storeKeyOf($), saved)
   const stale = (await $.store.keys()).filter(key => key.startsWith('session:')).slice(0, -KEPT_SESSIONS)
   await Promise.all(stale.map(key => $.store.delete(key)))
@@ -381,12 +440,52 @@ async function restore($: EngineInterface): Promise<void> {
   if (saved === null) return
   await update($, title, () => saved.title)
   await update($, todos, () => saved.todos)
+  await update($, summary, () => saved.summary ?? EMPTY_SUMMARY)
+}
+
+async function refreshSummary($: EngineInterface, policy: SummaryPolicy): Promise<void> {
+  const [current, turns, messages] = await Promise.all([read($, summary), $.session.turns(), $.session.messages()])
+  const fresh = messages.slice(current.coveredMessages)
+  if (fresh.length === 0) return
+  const reply = await $.model.complete({
+    model: policy.model,
+    system: SUMMARY_SYSTEM,
+    prompt: summaryPrompt(current.bullets, fresh),
+    maxTokens: 80,
+    effort: 'low',
+    timeoutMs: SUMMARY_TIMEOUT_MS,
+  })
+  if (!reply.isAnswered) return
+  await update($, summary, () => ({
+    bullets: appendBullet(current.bullets, reply.text),
+    coveredMessages: messages.length,
+    checkedAtTurn: turns,
+  }))
+  await persist($)
+}
+
+// The refresh runs in the background so a turn never waits for the summary model; when the
+// plugin reloads before the model answers, the late write is refused and must not surface.
+function refreshSummaryInBackground($: EngineInterface, policy: SummaryPolicy): void {
+  void refreshSummary($, policy).catch(() => undefined)
+}
+
+async function isSummaryDue($: EngineInterface, policy: SummaryPolicy): Promise<boolean> {
+  if (policy.everyPrompts <= 0) return false
+  const [current, turns] = await Promise.all([read($, summary), $.session.turns()])
+  const isFirst = current.bullets.length === 0 && current.checkedAtTurn === 0
+  return isFirst || turns - current.checkedAtTurn >= policy.everyPrompts
 }
 
 export const register: Register = (on, options) => {
   const isActivityLogShown = options.showActivityLog === true
+  const summaryPolicy: SummaryPolicy = {
+    everyPrompts: typeof options.summaryEveryPrompts === 'number' ? options.summaryEveryPrompts : 6,
+    model: typeof options.summaryModel === 'string' && options.summaryModel !== '' ? options.summaryModel : 'haiku',
+  }
   on('session.start', async ($, e, next) => {
     await restore($)
+    if (await isSummaryDue($, summaryPolicy)) refreshSummaryInBackground($, summaryPolicy)
     await $.command.register({ name: OPEN_COMMAND, description: 'Open the todo sidebar' })
     await $.command.register({ name: DEMO_COMMAND, description: 'Fill the todo sidebar with an example list' })
     await $.tool.register({
@@ -457,6 +556,7 @@ export const register: Register = (on, options) => {
     if (isMainThread) {
       await update($, toolActivity, () => [])
       await update($, agents, ageEndedAgents)
+      if (await isSummaryDue($, summaryPolicy)) refreshSummaryInBackground($, summaryPolicy)
     }
     await refreshAgents($)
 
@@ -489,12 +589,13 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'Pane', requestId: PANE_ID }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
-    const [list, heading, activity, roster, expanded] = await Promise.all([
+    const [list, heading, activity, roster, expanded, digest] = await Promise.all([
       read($, todos),
       read($, title),
       read($, toolActivity),
       read($, agents),
       read($, expandedParents),
+      read($, summary),
     ])
     const drawStep = (step: Step, mark: StepMark, indent: number, toggle?: { key: string; item: TodoItem }) => (
       <Box flexDirection="row" gap={1} paddingLeft={indent}>
@@ -513,11 +614,23 @@ export const register: Register = (on, options) => {
     const verbWidth = Math.max(0, ...activity.map(row => row.verb.length))
     const todoRows = list.reduce((count, item) => count + 1 + visibleSubtasks(item, expanded).length, 0)
     const agentRows = roster.length === 0 ? 0 : roster.length + 2
-    const activityRoom = Math.max(0, e.props.scroll.bodyRows - PANE_FIXED_ROWS - todoRows - agentRows)
+    const summaryRows = digest.bullets.length === 0 ? 0 : digest.bullets.length + 2
+    const activityRoom = Math.max(0, e.props.scroll.bodyRows - PANE_FIXED_ROWS - summaryRows - todoRows - agentRows)
     const shownActivity = activity.slice(-activityRoom)
 
     return (
       <Box flexDirection="column" paddingX={1} paddingTop={1} gap={1}>
+        {digest.bullets.length > 0 && (
+          <Box flexDirection="column">
+            <Text bold>Summary</Text>
+            {digest.bullets.map(bullet => (
+              <Box flexDirection="row" gap={1}>
+                <Text>·</Text>
+                <Text wrap="wrap">{bullet}</Text>
+              </Box>
+            ))}
+          </Box>
+        )}
         <Text bold>{heading ?? (list.length === 0 ? 'No todos yet.' : summarize(list))}</Text>
         {list.length > 0 && (
           <Box flexDirection="column">

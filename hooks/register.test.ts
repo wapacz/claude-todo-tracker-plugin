@@ -66,6 +66,38 @@ async function drawnRows(ui: SidebarMount): Promise<string[]> {
 function mockSession(on: On): void {
   on('session.cwd', () => ({ value: '/repo' }))
   on('session.id', () => ({ value: 'session-1' }))
+  on('session.turns', () => ({ value: 0 }))
+  on('session.messages', () => ({ value: [] }))
+}
+
+type Conversation = { turns: number; messages: { role: 'user' | 'assistant'; text: string; toolUses: never[] }[] }
+
+function mockConversation(on: On, replies: readonly string[]): { chat: Conversation; prompts: string[]; models: string[] } {
+  const chat: Conversation = { turns: 0, messages: [] }
+  const prompts: string[] = []
+  const models: string[] = []
+  const queue = [...replies]
+  on('session.cwd', () => ({ value: '/repo' }))
+  on('session.id', () => ({ value: 'session-1' }))
+  on('session.turns', () => ({ value: chat.turns }))
+  on('session.messages', () => ({ value: [...chat.messages] }))
+  on('agent.list', () => ({ value: [] }))
+  on('model.complete', (_, e) => {
+    prompts.push(e.prompt)
+    models.push(e.model)
+    const text = queue.shift()
+    return text === undefined
+      ? { value: { isAnswered: false, reason: 'empty-reply', usage: USAGE } }
+      : { value: { isAnswered: true, text, usage: USAGE } }
+  })
+  return { chat, prompts, models }
+}
+
+const USAGE = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+
+function say(chat: Conversation, user: string, assistant: string): void {
+  chat.turns += 1
+  chat.messages.push({ role: 'user', text: user, toolUses: [] }, { role: 'assistant', text: assistant, toolUses: [] })
 }
 
 function answerFileTools(on: On): void {
@@ -340,7 +372,8 @@ test('set_todos saves the list under the session id', async ($, on) => {
   await $.tool.call({ tool: SET_TODOS, title: 'Saved', todos: [...TODOS] })
 
   const saved = TODOS.map(step => ({ ...step, isForUser: false }))
-  expect(writes).toEqual([{ key: 'session:session-1', value: { title: 'Saved', todos: saved } }])
+  const summary = { bullets: [], coveredMessages: 0, checkedAtTurn: 0 }
+  expect(writes).toEqual([{ key: 'session:session-1', value: { title: 'Saved', todos: saved, summary } }])
 })
 
 test('a resumed session restores the saved list on start', async ($, on) => {
@@ -688,4 +721,149 @@ test('a restored list keeps its flags', async ($, on) => {
   const ui = await mountSidebar($, 'terminal')
 
   expect((await drawnRows(ui))[1]).toBe('⚑ Approve module 2')
+})
+
+test('the first turn end asks the summary model and draws its bullet above the todo list', async ($, on) => {
+  const { chat, prompts } = mockConversation(on, ['Built the todo sidebar plugin'])
+  mock.store(on)
+  on('turn.complete', () => ({ text: 'done' }))
+  await $.tool.call({ tool: SET_TODOS, title: 'Sidebar', todos: [TODOS[0]] })
+  say(chat, 'create a sidebar plugin', 'Done, the pane is live.')
+
+  await $.turn.complete(TURN_DONE)
+  const ui = await mountSidebar($, 'terminal')
+
+  expect((await drawnRows(ui)).slice(0, 3)).toEqual(['Summary', '· Built the todo sidebar plugin', 'Sidebar'])
+  expect(prompts).toHaveLength(1)
+  expect(prompts[0]).toContain('user: create a sidebar plugin')
+})
+
+test('the model is asked again only after six more prompts, and SAME keeps the bullets', async ($, on) => {
+  const { chat, prompts } = mockConversation(on, ['Built the sidebar', 'SAME', 'Moved on to publishing'])
+  mock.store(on)
+  on('turn.complete', () => ({ text: 'done' }))
+  const ui = await mountSidebar($, 'terminal')
+
+  say(chat, 'a', 'b')
+  await $.turn.complete(TURN_DONE)
+  for (let i = 0; i < 5; i += 1) {
+    say(chat, 'more', 'ok')
+    await $.turn.complete(TURN_DONE)
+  }
+  expect(prompts).toHaveLength(1)
+
+  say(chat, 'seventh', 'ok')
+  await $.turn.complete(TURN_DONE)
+  expect(prompts).toHaveLength(2)
+  expect(prompts[1]).not.toContain('user: a')
+  expect((await drawnRows(ui)).slice(0, 2)).toEqual(['Summary', '· Built the sidebar'])
+
+  for (let i = 0; i < 6; i += 1) say(chat, 'publish it', 'pushed')
+  await $.turn.complete(TURN_DONE)
+  expect((await drawnRows(ui)).slice(1, 3)).toEqual(['· Built the sidebar', '· Moved on to publishing'])
+})
+
+test('the summary keeps at most three bullets, oldest first to go', async ($, on) => {
+  const { chat } = mockConversation(on, ['One', 'Two', 'Three', 'Four'])
+  mock.store(on)
+  on('turn.complete', () => ({ text: 'done' }))
+  const ui = await mountSidebar($, 'terminal')
+
+  for (let round = 0; round < 4; round += 1) {
+    for (let i = 0; i < 6; i += 1) say(chat, 'x', 'y')
+    await $.turn.complete(TURN_DONE)
+  }
+
+  expect((await drawnRows(ui)).slice(0, 4)).toEqual(['Summary', '· Two', '· Three', '· Four'])
+})
+
+test('a failed model call leaves the summary alone and is retried at the next turn end', async ($, on) => {
+  const { chat, prompts } = mockConversation(on, [])
+  mock.store(on)
+  on('turn.complete', () => ({ text: 'done' }))
+  say(chat, 'a', 'b')
+
+  await $.turn.complete(TURN_DONE)
+  await $.turn.complete(TURN_DONE)
+  const ui = await mountSidebar($, 'terminal')
+
+  expect(prompts).toHaveLength(2)
+  expect((await drawnRows(ui))[0]).toBe('No todos yet.')
+})
+
+test('a subagent turn end never asks the summary model', async ($, on) => {
+  const { chat, prompts } = mockConversation(on, ['Nope'])
+  mock.store(on)
+  on('turn.complete', () => ({ text: 'done' }))
+  say(chat, 'a', 'b')
+
+  await $.turn.complete({ ...TURN_DONE, agentId: 'agent-1' })
+
+  expect(prompts).toHaveLength(0)
+})
+
+test('summaryEveryPrompts 0 turns the summary off', { options: { summaryEveryPrompts: 0 } }, async ($, on) => {
+  const { chat, prompts } = mockConversation(on, ['Nope'])
+  mock.store(on)
+  on('turn.complete', () => ({ text: 'done' }))
+  say(chat, 'a', 'b')
+
+  await $.turn.complete(TURN_DONE)
+
+  expect(prompts).toHaveLength(0)
+})
+
+test('the summary model comes from the summaryModel option', { options: { summaryModel: 'claude-sonnet-5-5' } }, async ($, on) => {
+  const { chat, models } = mockConversation(on, ['Hi'])
+  mock.store(on)
+  on('turn.complete', () => ({ text: 'done' }))
+  say(chat, 'a', 'b')
+
+  await $.turn.complete(TURN_DONE)
+
+  expect(models).toEqual(['claude-sonnet-5-5'])
+})
+
+test('a restored session brings its summary back', async ($, on) => {
+  answerSessionStart(on)
+  mockSession(on)
+  mock.store(on, {
+    'session:session-1': {
+      title: 'Restored',
+      todos: [{ content: 'x', status: 'completed', activeForm: 'x', isForUser: false }],
+      summary: { bullets: ['Built it'], coveredMessages: 4, checkedAtTurn: 2 },
+    },
+  })
+
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  const ui = await mountSidebar($, 'terminal')
+
+  expect((await drawnRows(ui)).slice(0, 2)).toEqual(['Summary', '· Built it'])
+})
+
+test('markdown markers are stripped from titles, rows and summary bullets', async ($, on) => {
+  const { chat } = mockConversation(on, ['**Shipped** the `sidebar`'])
+  mock.store(on)
+  on('turn.complete', () => ({ text: 'done' }))
+  await $.tool.call({
+    tool: SET_TODOS,
+    title: '## Fix `auth` flow',
+    todos: [
+      { content: 'Added **Google** OAuth provider', status: 'completed' },
+      { content: 'Edit `src/auth.ts` and _retry_', status: 'in_progress', activeForm: 'Editing *src/auth.ts*' },
+      { content: 'Keep 2*3 and snake_case_name as they are', status: 'pending' },
+    ],
+  })
+  say(chat, 'a', 'b')
+  await $.turn.complete(TURN_DONE)
+  const ui = await mountSidebar($, 'terminal')
+
+  expect(await drawnRows(ui)).toEqual([
+    'Summary',
+    '· Shipped the sidebar',
+    'Fix auth flow',
+    '✓ Added Google OAuth provider',
+    '○ Editing src/auth.ts…',
+    '○ Keep 2*3 and snake_case_name as they are',
+  ])
 })

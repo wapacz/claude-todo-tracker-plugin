@@ -1,0 +1,12 @@
+{
+  "name": "todo-sidebar",
+  "version": "0.1.0",
+  "description": "Docked right-hand sidebar showing the live TodoWrite list, fixed while the transcript scrolls",
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "Michal Lapacz",
+    "url": "https://github.com/wapacz"
+  },
+  "repository": "https://github.com/wapacz/claude-todo-tracker-plugin",
+  "license": "MIT"
+}

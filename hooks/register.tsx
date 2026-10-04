@@ -55,7 +55,12 @@ const DEMO_ACTIVITY: ToolActivity[] = [
 ]
 
 const STEP_PROPERTIES = {
-  content: { type: 'string', description: 'Past tense once done reads best, e.g. "Added OAuth provider"' },
+  content: {
+    type: 'string',
+    description:
+      'An outcome in the user\'s words, past tense once done, e.g. "Added OAuth provider". ' +
+      'A step the user must take starts with "You:", e.g. "You: approve module 2". Never agent mechanics like "Ran tests".',
+  },
   status: { type: 'string', enum: STATUSES },
   activeForm: { type: 'string', description: 'Present continuous form, e.g. "Updating documentation"' },
 }
@@ -333,8 +338,11 @@ export const register: Register = (on, options) => {
     await $.tool.register({
       name: SET_TODOS_TOOL,
       description:
-        'Replace the todo list shown in the Todos sidebar. Call it whenever your plan changes: ' +
-        'when you start a multi-step task (give a short title), start a step (in_progress) or finish one (completed).',
+        'Replace the todo list shown in the Todos sidebar. The sidebar is written for the user, not for you: ' +
+        'they read it to see what has been done and what they must do next, so every item must make sense ' +
+        'without the transcript, and items that need the user\'s action start with "You:". ' +
+        'Call it whenever the plan changes: when you start a multi-step task (give a short title), ' +
+        'start a step (in_progress) or finish one (completed).',
       inputSchema: SET_TODOS_SCHEMA,
     })
     void $.ui.open({ id: PANE_ID, title: PANE_TITLE })

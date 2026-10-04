@@ -29,7 +29,8 @@ Implement OAuth scopes
 - Shows the tool calls the agent makes while it works on the current step (`Read`, `Edit`, `Write`,
   `Run`, with diff counts for edits). The log clears when the turn ends or the step changes.
 - Gives the model a `set_todos` tool to keep the list up to date, and mirrors the built-in
-  `TodoWrite` tool where a session has it.
+  `TodoWrite` tool where a session has it. The list is written for the person, not the model:
+  outcomes in plain words, and steps the person must take start with `You:`.
 - Saves the list per session and restores it when the session is resumed.
 
 ## Commands

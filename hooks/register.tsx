@@ -19,6 +19,7 @@ const todos = atom({ plugin: 'todo-sidebar', key: 'todos' } as const, [])
 const title = atom({ plugin: 'todo-sidebar', key: 'title' } as const, null)
 const toolActivity = atom({ plugin: 'todo-sidebar', key: 'toolActivity' } as const, [])
 const agents = atom({ plugin: 'todo-sidebar', key: 'agents' } as const, [])
+const expandedParents = atom({ plugin: 'todo-sidebar', key: 'expandedParents' } as const, [])
 
 const STATUSES: readonly TodoStatus[] = ['pending', 'in_progress', 'completed']
 
@@ -218,6 +219,22 @@ function ageEndedAgents(rows: readonly AgentRow[]): AgentRow[] {
   return rows.map(row => (hasEnded(row) ? { ...row, turnsSinceEnd: row.turnsSinceEnd + 1 } : row))
 }
 
+function canCollapse(item: TodoItem): boolean {
+  return (item.subtasks?.length ?? 0) > 0 && effectiveStatus(item) === 'completed'
+}
+
+function isExpanded(item: TodoItem, expanded: readonly string[]): boolean {
+  return !canCollapse(item) || expanded.includes(item.content)
+}
+
+function toggled(expanded: readonly string[], content: string): string[] {
+  return expanded.includes(content) ? expanded.filter(one => one !== content) : [...expanded, content]
+}
+
+function visibleSubtasks(item: TodoItem, expanded: readonly string[]): Step[] {
+  return isExpanded(item, expanded) ? item.subtasks ?? [] : []
+}
+
 function agentStatusNote(row: AgentRow): string {
   return row.status === 'running' || row.status === 'completed' ? '' : row.status
 }
@@ -353,6 +370,8 @@ export const register: Register = (on, options) => {
     const hasStepChanged = runningStepOf(previous) !== runningStepOf(parsed.todos)
     if (hasStepChanged) await update($, toolActivity, () => [])
     await update($, todos, () => parsed.todos)
+    const contents = new Set(parsed.todos.map(item => item.content))
+    await update($, expandedParents, expanded => expanded.filter(content => contents.has(content)))
     await persist($)
 
     return { result: `Sidebar updated: ${summarize(parsed.todos)}.` }
@@ -406,21 +425,30 @@ export const register: Register = (on, options) => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE_ID }, async ($, e) => {
-    const { Box, Text } = $.ui.resolve(e)
-    const drawStep = (step: Step, mark: StepMark, indent: number) => (
-      <Box flexDirection="row" gap={1} paddingLeft={indent}>
-        <Text color={MARK_COLOR[mark]}>{MARK_GLYPH[mark]}</Text>
-        <Text wrap="truncate-end">{isRunning(mark) ? `${step.activeForm}…` : step.content}</Text>
-      </Box>
-    )
-    const [list, heading, activity, roster] = await Promise.all([
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const [list, heading, activity, roster, expanded] = await Promise.all([
       read($, todos),
       read($, title),
       read($, toolActivity),
       read($, agents),
+      read($, expandedParents),
     ])
+    const drawStep = (step: Step, mark: StepMark, indent: number, toggle?: { key: string; item: TodoItem }) => (
+      <Box flexDirection="row" gap={1} paddingLeft={indent}>
+        <Text color={MARK_COLOR[mark]}>{MARK_GLYPH[mark]}</Text>
+        <Text wrap="truncate-end">{isRunning(mark) ? `${step.activeForm}…` : step.content}</Text>
+        {toggle !== undefined && (
+          <Button
+            key={toggle.key}
+            plain
+            label={isExpanded(toggle.item, expanded) ? '▾' : `▸ ${toggle.item.subtasks?.length ?? 0}`}
+            onPress={() => void update($, expandedParents, current => toggled(current, toggle.item.content))}
+          />
+        )}
+      </Box>
+    )
     const verbWidth = Math.max(0, ...activity.map(row => row.verb.length))
-    const todoRows = list.reduce((count, item) => count + 1 + (item.subtasks?.length ?? 0), 0)
+    const todoRows = list.reduce((count, item) => count + 1 + visibleSubtasks(item, expanded).length, 0)
     const agentRows = roster.length === 0 ? 0 : roster.length + 2
     const activityRoom = Math.max(0, e.props.scroll.bodyRows - PANE_FIXED_ROWS - todoRows - agentRows)
     const shownActivity = activity.slice(-activityRoom)
@@ -430,9 +458,9 @@ export const register: Register = (on, options) => {
         <Text bold>{heading ?? (list.length === 0 ? 'No todos yet.' : summarize(list))}</Text>
         {list.length > 0 && (
           <Box flexDirection="column">
-            {list.flatMap(item => [
-              drawStep(item, markOf(item), 0),
-              ...(item.subtasks ?? []).map(step => drawStep(step, step.status, SUBTASK_INDENT)),
+            {list.flatMap((item, index) => [
+              drawStep(item, markOf(item), 0, canCollapse(item) ? { key: `toggle-${index}`, item } : undefined),
+              ...visibleSubtasks(item, expanded).map(step => drawStep(step, step.status, SUBTASK_INDENT)),
             ])}
           </Box>
         )}

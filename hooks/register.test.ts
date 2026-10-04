@@ -41,6 +41,7 @@ function isDrawn(value: unknown): value is Drawn {
 function textOf(node: unknown): string {
   if (typeof node === 'string') return node
   if (!isDrawn(node)) return ''
+  if (node.type === 'Button') return String(node.props?.label ?? '')
   return (node.children ?? []).map(textOf).join('')
 }
 
@@ -229,7 +230,7 @@ test('a parent is done once every subtask is done, whatever its own status says'
   await $.tool.call({ tool: SET_TODOS, todos: [allDone] })
   const ui = await mountSidebar($, 'terminal')
 
-  expect((await drawnRows(ui)).slice(0, 2)).toEqual(['1/1 done, 0 in progress', '✓ Update documentation'])
+  expect((await drawnRows(ui)).slice(0, 2)).toEqual(['1/1 done, 0 in progress', '✓ Update documentation ▸ 3'])
 })
 
 test('a parent with only pending subtasks keeps its own status', async ($, on) => {
@@ -514,4 +515,58 @@ test('when rows run short the agents block keeps its rows and the activity log s
 
   expect(rows.filter(row => row.startsWith('│'))).toEqual(['│ Read b.ts', '│ Read c.ts'])
   expect(rows.filter(row => row.includes('code-reviewer') || row.includes('Explore') || row.includes('general-purpose'))).toHaveLength(3)
+})
+
+const FINISHED_PARENT = {
+  ...PARENT_WITH_SUBTASKS,
+  content: 'Updated documentation',
+  subtasks: PARENT_WITH_SUBTASKS.subtasks.map(step => ({ ...step, status: 'completed' as const })),
+}
+
+test('a finished parent hides its subtasks behind a toggle that shows their count', async ($, on) => {
+  mockSession(on)
+  mock.store(on)
+  await $.tool.call({ tool: SET_TODOS, todos: [FINISHED_PARENT, PARENT_WITH_SUBTASKS] })
+
+  for (const surface of SURFACES) {
+    const ui = await mountSidebar($, surface)
+    const rows = await drawnRows(ui)
+
+    expect(rows[1]).toBe('✓ Updated documentation ▸ 3')
+    expect(rows[2]).toBe('◐ Updating documentation…')
+    expect(rows).toHaveLength(6)
+    expect(await ui.findAll({ type: 'Button' })).toHaveLength(1)
+  }
+})
+
+test('pressing the toggle expands the finished parent and pressing again collapses it', async ($, on) => {
+  mockSession(on)
+  mock.store(on)
+  await $.tool.call({ tool: SET_TODOS, todos: [FINISHED_PARENT] })
+  const ui = await mountSidebar($, 'terminal')
+
+  await ui.press({ key: 'toggle-0' })
+  expect(await drawnRows(ui)).toEqual([
+    '1/1 done, 0 in progress',
+    '✓ Updated documentation ▾',
+    '    ✓ Wrote docs/oauth.md',
+    '    ✓ Add README section',
+    '    ✓ Link from CHANGELOG',
+  ])
+
+  await ui.press({ key: 'toggle-0' })
+  expect(await drawnRows(ui)).toHaveLength(2)
+})
+
+test('an expanded parent that leaves the list is forgotten', async ($, on) => {
+  mockSession(on)
+  mock.store(on)
+  await $.tool.call({ tool: SET_TODOS, todos: [FINISHED_PARENT] })
+  const ui = await mountSidebar($, 'terminal')
+  await ui.press({ key: 'toggle-0' })
+
+  await $.tool.call({ tool: SET_TODOS, todos: [TODOS[0]] })
+  await $.tool.call({ tool: SET_TODOS, todos: [FINISHED_PARENT] })
+
+  expect((await drawnRows(ui))[1]).toBe('✓ Updated documentation ▸ 3')
 })

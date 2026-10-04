@@ -32,6 +32,7 @@ declare module 'claude-code' {
       title: string | null
       toolActivity: ToolActivity[]
       agents: AgentRow[]
+      expandedParents: string[]
     }
   }
 }

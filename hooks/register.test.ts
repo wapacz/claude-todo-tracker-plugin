@@ -622,3 +622,70 @@ test('forUser must be a boolean', async ($, on) => {
 
   expect(denied.deny).toBe('set_todos: todos[0].forUser must be true or false')
 })
+
+const RUNNING_WITH_SUBTASKS = {
+  content: 'Approve §2 Components',
+  status: 'in_progress',
+  activeForm: 'Approving §2 Components',
+  subtasks: [
+    { content: 'Reviewed prefixed Turtle', status: 'completed' },
+    { content: 'Review breadcrumbs', status: 'in_progress' },
+  ],
+} as const
+
+test('a finished row resent without subtasks keeps them, all marked done, when its text is unchanged', async ($, on) => {
+  mockSession(on)
+  mock.store(on)
+  await $.tool.call({ tool: SET_TODOS, todos: [TODOS[0], RUNNING_WITH_SUBTASKS] })
+  await $.tool.call({ tool: SET_TODOS, todos: [TODOS[0], { ...RUNNING_WITH_SUBTASKS, status: 'completed', subtasks: undefined }] })
+  const ui = await mountSidebar($, 'terminal')
+
+  expect((await drawnRows(ui))[2]).toBe('✓ Approve §2 Components ▸ 2')
+  await ui.press({ key: 'toggle-1' })
+  expect((await drawnRows(ui)).slice(3)).toEqual(['    ✓ Reviewed prefixed Turtle', '    ✓ Review breadcrumbs'])
+})
+
+test('a finished row rewritten in past tense at the same position keeps the subtasks too', async ($, on) => {
+  mockSession(on)
+  mock.store(on)
+  await $.tool.call({ tool: SET_TODOS, todos: [TODOS[0], RUNNING_WITH_SUBTASKS, TODOS[2]] })
+  await $.tool.call({
+    tool: SET_TODOS,
+    todos: [TODOS[0], { content: 'Approved §2 Components: prefixed Turtle', status: 'completed' }, { ...TODOS[2], status: 'in_progress' }],
+  })
+  const ui = await mountSidebar($, 'terminal')
+
+  expect((await drawnRows(ui))[2]).toBe('✓ Approved §2 Components: prefixed Turtle ▸ 2')
+})
+
+test('no inheritance when the row brings its own subtasks or the list changed length', async ($, on) => {
+  mockSession(on)
+  mock.store(on)
+  await $.tool.call({ tool: SET_TODOS, todos: [TODOS[0], RUNNING_WITH_SUBTASKS] })
+
+  await $.tool.call({
+    tool: SET_TODOS,
+    todos: [TODOS[0], { content: 'Approved §2', status: 'completed', subtasks: [{ content: 'Only this', status: 'completed' }] }],
+  })
+  const ui = await mountSidebar($, 'terminal')
+  expect((await drawnRows(ui))[2]).toBe('✓ Approved §2 ▸ 1')
+
+  await $.tool.call({ tool: SET_TODOS, todos: [TODOS[0], { content: 'Approved §2 again', status: 'completed' }, TODOS[2]] })
+  expect((await drawnRows(ui))[2]).toBe('✓ Approved §2 again')
+})
+
+test('a restored list keeps its flags', async ($, on) => {
+  answerSessionStart(on)
+  mockSession(on)
+  mock.store(on, {
+    'session:session-1': {
+      title: 'Restored',
+      todos: [{ content: 'Approve module 2', status: 'pending', activeForm: 'Approving module 2', isForUser: true }],
+    },
+  })
+
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  const ui = await mountSidebar($, 'terminal')
+
+  expect((await drawnRows(ui))[1]).toBe('⚑ Approve module 2')
+})

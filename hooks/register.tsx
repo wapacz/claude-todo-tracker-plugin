@@ -277,11 +277,45 @@ function runningStepOf(list: readonly TodoItem[]): string | null {
 
 type SavedList = { title: string | null; todos: TodoItem[] }
 
+function savedStepToInput(value: unknown): unknown {
+  if (typeof value !== 'object' || value === null) return value
+  const { isForUser, subtasks, ...rest } = value as Record<string, unknown>
+  return {
+    ...rest,
+    forUser: isForUser === true,
+    ...(Array.isArray(subtasks) ? { subtasks: subtasks.map(savedStepToInput) } : {}),
+  }
+}
+
 function parseSaved(value: unknown): SavedList | null {
   if (typeof value !== 'object' || value === null) return null
   const { title: savedTitle, todos: savedTodos } = value as Record<string, unknown>
-  const parsed = parseTodos(savedTodos)
+  if (!Array.isArray(savedTodos)) return null
+  const parsed = parseTodos(savedTodos.map(savedStepToInput))
   return parsed.success ? { title: parseTitle(savedTitle), todos: parsed.todos } : null
+}
+
+function completedCopy(steps: readonly Step[]): Step[] {
+  return steps.map(step => ({ ...step, status: 'completed' }))
+}
+
+function findInheritSource(incoming: TodoItem, index: number, previous: readonly TodoItem[], isSameLength: boolean): TodoItem | undefined {
+  const sameText = previous.find(item => item.content === incoming.content)
+  if (sameText !== undefined) return sameText
+  const samePlace = previous[index]
+  const wasRunningHere = samePlace !== undefined && effectiveStatus(samePlace) !== 'completed'
+  return isSameLength && incoming.status === 'completed' && wasRunningHere ? samePlace : undefined
+}
+
+function inheritSubtasks(previous: readonly TodoItem[], incoming: readonly TodoItem[]): TodoItem[] {
+  const isSameLength = previous.length === incoming.length
+  return incoming.map((item, index) => {
+    if ((item.subtasks?.length ?? 0) > 0) return item
+    const source = findInheritSource(item, index, previous, isSameLength)
+    const inherited = source?.subtasks ?? []
+    if (inherited.length === 0) return item
+    return { ...item, subtasks: item.status === 'completed' ? completedCopy(inherited) : inherited }
+  })
 }
 
 function countByStatus(list: readonly TodoItem[], status: TodoStatus): number {
@@ -395,14 +429,15 @@ export const register: Register = (on, options) => {
     const nextTitle = parseTitle(e.title)
     if (nextTitle !== null) await update($, title, () => nextTitle)
     const previous = await read($, todos)
-    const hasStepChanged = runningStepOf(previous) !== runningStepOf(parsed.todos)
+    const nextTodos = inheritSubtasks(previous, parsed.todos)
+    const hasStepChanged = runningStepOf(previous) !== runningStepOf(nextTodos)
     if (hasStepChanged) await update($, toolActivity, () => [])
-    await update($, todos, () => parsed.todos)
-    const contents = new Set(parsed.todos.map(item => item.content))
+    await update($, todos, () => nextTodos)
+    const contents = new Set(nextTodos.map(item => item.content))
     await update($, expandedParents, expanded => expanded.filter(content => contents.has(content)))
     await persist($)
 
-    return { result: `Sidebar updated: ${summarize(parsed.todos)}.` }
+    return { result: `Sidebar updated: ${summarize(nextTodos)}.` }
   })
 
   on('tool.call', { tool: 'TodoWrite' }, async ($, e, next) => {

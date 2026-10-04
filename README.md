@@ -33,6 +33,9 @@ Implement OAuth scopes
   outcomes in plain words, and steps only the person can take carry `forUser: true` and are
   drawn with a yellow flag until done.
 - Saves the list per session and restores it when the session is resumed.
+- Keeps a finished row's subtasks when a later call resends the row without them, matched by the
+  same text or the same position in a list of the same length, so finished detail is not lost to a
+  careless rewrite.
 
 ## Commands
 

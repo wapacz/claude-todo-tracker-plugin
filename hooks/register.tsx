@@ -31,21 +31,22 @@ const TOOL_VERB: Record<string, string> = {
 
 const DEMO_TITLE = 'Implement OAuth scopes'
 const DEMO_TODOS: TodoItem[] = [
-  { content: 'Added Google OAuth provider', status: 'completed', activeForm: 'Adding Google OAuth provider' },
-  { content: 'Updated callback handling', status: 'completed', activeForm: 'Updating callback handling' },
-  { content: 'Configured scope mapping', status: 'completed', activeForm: 'Configuring scope mapping' },
-  { content: 'Added tests for OAuth flow', status: 'completed', activeForm: 'Adding tests for OAuth flow' },
+  { content: 'Added Google OAuth provider', status: 'completed', activeForm: 'Adding Google OAuth provider', isForUser: false },
+  { content: 'Updated callback handling', status: 'completed', activeForm: 'Updating callback handling', isForUser: false },
+  { content: 'Configured scope mapping', status: 'completed', activeForm: 'Configuring scope mapping', isForUser: false },
+  { content: 'Added tests for OAuth flow', status: 'completed', activeForm: 'Adding tests for OAuth flow', isForUser: false },
   {
     content: 'Update documentation',
     status: 'in_progress',
     activeForm: 'Updating documentation',
+    isForUser: false,
     subtasks: [
-      { content: 'Wrote docs/oauth.md', status: 'completed', activeForm: 'Writing docs/oauth.md' },
-      { content: 'Add README section', status: 'in_progress', activeForm: 'Adding README section' },
-      { content: 'Link from CHANGELOG', status: 'pending', activeForm: 'Linking from CHANGELOG' },
+      { content: 'Wrote docs/oauth.md', status: 'completed', activeForm: 'Writing docs/oauth.md', isForUser: false },
+      { content: 'Add README section', status: 'in_progress', activeForm: 'Adding README section', isForUser: false },
+      { content: 'Link from CHANGELOG', status: 'pending', activeForm: 'Linking from CHANGELOG', isForUser: false },
     ],
   },
-  { content: 'Open pull request', status: 'pending', activeForm: 'Opening pull request' },
+  { content: 'Open pull request', status: 'pending', activeForm: 'Opening pull request', isForUser: true },
 ]
 const DEMO_ACTIVITY: ToolActivity[] = [
   { id: 'demo-1', verb: 'Read', target: 'auth.provider.ts', isDone: true },
@@ -59,10 +60,16 @@ const STEP_PROPERTIES = {
     type: 'string',
     description:
       'An outcome in the user\'s words, past tense once done, e.g. "Added OAuth provider". ' +
-      'A step the user must take starts with "You:", e.g. "You: approve module 2". Never agent mechanics like "Ran tests".',
+      'A step only the user can take is an instruction to them, e.g. "Approve module 2", with forUser true. Never agent mechanics like "Ran tests".',
   },
   status: { type: 'string', enum: STATUSES },
   activeForm: { type: 'string', description: 'Present continuous form, e.g. "Updating documentation"' },
+  forUser: {
+    type: 'boolean',
+    description:
+      'True when only the user can do this step (approve, decide, log in). Drawn with a flag until done. ' +
+      'Write its content as an instruction to the user, e.g. "Approve module 2".',
+  },
 }
 
 const SET_TODOS_SCHEMA = {
@@ -99,11 +106,17 @@ function isTodoStatus(value: unknown): value is TodoStatus {
 
 function parseStep(value: unknown, path: string): Step | string {
   if (typeof value !== 'object' || value === null) return `${path} is not an object`
-  const { content, status, activeForm } = value as Record<string, unknown>
+  const { content, status, activeForm, forUser } = value as Record<string, unknown>
   if (typeof content !== 'string' || content.trim() === '') return `${path}.content must be a non-empty string`
   if (!isTodoStatus(status)) return `${path}.status must be one of ${STATUSES.join(', ')}`
+  if (forUser !== undefined && typeof forUser !== 'boolean') return `${path}.forUser must be true or false`
 
-  return { content, status, activeForm: typeof activeForm === 'string' ? activeForm : content }
+  return {
+    content,
+    status,
+    activeForm: typeof activeForm === 'string' ? activeForm : content,
+    isForUser: forUser === true,
+  }
 }
 
 function parseSubtasks(value: unknown, path: string): Step[] | string {
@@ -139,7 +152,7 @@ function parseTodos(value: unknown): ParsedTodos {
   return { success: true, todos: parsed.filter((item): item is TodoItem => typeof item !== 'string') }
 }
 
-type StepMark = TodoStatus | 'partial'
+type StepMark = TodoStatus | 'partial' | 'for_user'
 
 function hasPartlyDoneSubtasks(item: TodoItem): boolean {
   const subtasks = item.subtasks ?? []
@@ -155,13 +168,19 @@ function effectiveStatus(item: TodoItem): TodoStatus {
   return hasPartlyDoneSubtasks(item) ? 'in_progress' : item.status
 }
 
+function markOfStep(step: Step, status: TodoStatus): StepMark {
+  return step.isForUser && status !== 'completed' ? 'for_user' : status
+}
+
 function markOf(item: TodoItem): StepMark {
-  return hasPartlyDoneSubtasks(item) ? 'partial' : effectiveStatus(item)
+  if (hasPartlyDoneSubtasks(item)) return 'partial'
+  return markOfStep(item, effectiveStatus(item))
 }
 
 const MARK_GLYPH: Record<StepMark, string> = {
   completed: '✓',
   partial: '◐',
+  for_user: '⚑',
   in_progress: '○',
   pending: '○',
 }
@@ -169,6 +188,7 @@ const MARK_GLYPH: Record<StepMark, string> = {
 const MARK_COLOR: Record<StepMark, string | undefined> = {
   completed: 'green',
   partial: 'yellow',
+  for_user: 'yellow',
   in_progress: undefined,
   pending: undefined,
 }
@@ -340,7 +360,7 @@ export const register: Register = (on, options) => {
       description:
         'Replace the todo list shown in the Todos sidebar. The sidebar is written for the user, not for you: ' +
         'they read it to see what has been done and what they must do next, so every item must make sense ' +
-        'without the transcript, and items that need the user\'s action start with "You:". ' +
+        'without the transcript, and items that need the user\'s action carry forUser: true. ' +
         'Call it whenever the plan changes: when you start a multi-step task (give a short title), ' +
         'start a step (in_progress) or finish one (completed).',
       inputSchema: SET_TODOS_SCHEMA,
@@ -390,7 +410,7 @@ export const register: Register = (on, options) => {
     const hasSucceeded = ran.deny === undefined && ran.isError !== true
 
     if (hasSucceeded) {
-      await update($, todos, () => [...e.todos])
+      await update($, todos, () => e.todos.map(step => ({ ...step, isForUser: false })))
       await persist($)
     }
 
@@ -468,7 +488,7 @@ export const register: Register = (on, options) => {
           <Box flexDirection="column">
             {list.flatMap((item, index) => [
               drawStep(item, markOf(item), 0, canCollapse(item) ? { key: `toggle-${index}`, item } : undefined),
-              ...visibleSubtasks(item, expanded).map(step => drawStep(step, step.status, SUBTASK_INDENT)),
+              ...visibleSubtasks(item, expanded).map(step => drawStep(step, markOfStep(step, step.status), SUBTASK_INDENT)),
             ])}
           </Box>
         )}

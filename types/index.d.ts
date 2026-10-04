@@ -4,6 +4,7 @@ export type Step = {
   content: string
   status: TodoStatus
   activeForm: string
+  isForUser: boolean
 }
 
 export type TodoItem = Step & {

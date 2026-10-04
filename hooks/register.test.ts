@@ -339,13 +339,14 @@ test('set_todos saves the list under the session id', async ($, on) => {
 
   await $.tool.call({ tool: SET_TODOS, title: 'Saved', todos: [...TODOS] })
 
-  expect(writes).toEqual([{ key: 'session:session-1', value: { title: 'Saved', todos: [...TODOS] } }])
+  const saved = TODOS.map(step => ({ ...step, isForUser: false }))
+  expect(writes).toEqual([{ key: 'session:session-1', value: { title: 'Saved', todos: saved } }])
 })
 
 test('a resumed session restores the saved list on start', async ($, on) => {
   mockSession(on)
   answerSessionStart(on)
-  mock.store(on, { 'session:session-1': { title: 'Restored', todos: [...TODOS] } })
+  mock.store(on, { 'session:session-1': { title: 'Restored', todos: TODOS.map(step => ({ ...step, isForUser: false })) } })
 
   await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
   const ui = await mountSidebar($, 'terminal')
@@ -356,7 +357,7 @@ test('a resumed session restores the saved list on start', async ($, on) => {
 test('a start with todos already in state does not overwrite them from the store', async ($, on) => {
   mockSession(on)
   answerSessionStart(on)
-  mock.store(on, { 'session:session-1': { title: 'Stale', todos: [...TODOS] } })
+  mock.store(on, { 'session:session-1': { title: 'Stale', todos: TODOS.map(step => ({ ...step, isForUser: false })) } })
   await $.tool.call({ tool: SET_TODOS, title: 'Live', todos: [TODOS[2]] })
 
   await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
@@ -569,4 +570,55 @@ test('an expanded parent that leaves the list is forgotten', async ($, on) => {
   await $.tool.call({ tool: SET_TODOS, todos: [FINISHED_PARENT] })
 
   expect((await drawnRows(ui))[1]).toBe('✓ Updated documentation ▸ 3')
+})
+
+test('a step only the user can take is drawn with a yellow flag and its instruction', async ($, on) => {
+  mockSession(on)
+  mock.store(on)
+  await $.tool.call({
+    tool: SET_TODOS,
+    todos: [
+      TODOS[0],
+      { content: 'Approve module 2', status: 'in_progress', activeForm: 'Approving module 2', forUser: true },
+      { content: 'Pick the layout', status: 'pending', forUser: true },
+    ],
+  })
+
+  for (const surface of SURFACES) {
+    const ui = await mountSidebar($, surface)
+
+    expect((await drawnRows(ui)).slice(1)).toEqual(['✓ Wrote the sidebar', '⚑ Approve module 2', '⚑ Pick the layout'])
+    const flags = (await ui.findAll({ type: 'Text' })).filter(element => element.text === '⚑')
+    expect(flags.map(flag => flag.props.color)).toEqual(['yellow', 'yellow'])
+  }
+})
+
+test('a flagged step that is done shows the green check like any other', async ($, on) => {
+  mockSession(on)
+  mock.store(on)
+  await $.tool.call({ tool: SET_TODOS, todos: [{ content: 'Approved module 2', status: 'completed', forUser: true }] })
+  const ui = await mountSidebar($, 'terminal')
+
+  expect((await drawnRows(ui))[1]).toBe('✓ Approved module 2')
+})
+
+test('a flagged subtask under a running parent carries the flag too', async ($, on) => {
+  mockSession(on)
+  mock.store(on)
+  const parent = {
+    ...PARENT_WITH_SUBTASKS,
+    subtasks: [...PARENT_WITH_SUBTASKS.subtasks.slice(0, 2), { content: 'Approve the docs', status: 'pending', forUser: true }],
+  }
+  await $.tool.call({ tool: SET_TODOS, todos: [parent] })
+  const ui = await mountSidebar($, 'terminal')
+
+  expect((await drawnRows(ui))[4]).toBe('    ⚑ Approve the docs')
+})
+
+test('forUser must be a boolean', async ($, on) => {
+  mockSession(on)
+  mock.store(on)
+  const denied = await $.tool.call({ tool: SET_TODOS, todos: [{ content: 'x', status: 'pending', forUser: 'yes' }] })
+
+  expect(denied.deny).toBe('set_todos: todos[0].forUser must be true or false')
 })

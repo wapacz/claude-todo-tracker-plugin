@@ -30,7 +30,8 @@ Implement OAuth scopes
   `Run`, with diff counts for edits). The log clears when the turn ends or the step changes.
 - Gives the model a `set_todos` tool to keep the list up to date, and mirrors the built-in
   `TodoWrite` tool where a session has it. The list is written for the person, not the model:
-  outcomes in plain words, and steps the person must take start with `You:`.
+  outcomes in plain words, and steps only the person can take carry `forUser: true` and are
+  drawn with a yellow flag until done.
 - Saves the list per session and restores it when the session is resumed.
 
 ## Commands

@@ -132,7 +132,7 @@ test('set_todos denies a malformed list and keeps the previous one', async ($, o
   expect(await drawnRows(ui)).toHaveLength(4)
 })
 
-test('tool calls appear as an activity log with verb, target and diff counts', async ($, on) => {
+test('tool calls appear as an activity log with verb, target and diff counts', { options: { showActivityLog: true } }, async ($, on) => {
   mockSession(on)
   mock.store(on)
   answerFileTools(on)
@@ -272,7 +272,7 @@ test('a malformed subtask names its path in the denial', async ($, on) => {
 
 const TURN_DONE = { reason: 'answer', answer: 'done', durationMs: 1000, isAborted: false, turnId: 't1' } as const
 
-test('the activity log clears when the turn completes', async ($, on) => {
+test('the activity log clears when the turn completes', { options: { showActivityLog: true } }, async ($, on) => {
   mockSession(on)
   mock.store(on)
   answerFileTools(on)
@@ -286,7 +286,7 @@ test('the activity log clears when the turn completes', async ($, on) => {
   expect((await drawnRows(ui)).some(row => row.startsWith('│'))).toBe(false)
 })
 
-test('a subagent turn completing leaves the activity log alone', async ($, on) => {
+test('a subagent turn completing leaves the activity log alone', { options: { showActivityLog: true } }, async ($, on) => {
   mockSession(on)
   mock.store(on)
   answerFileTools(on)
@@ -300,7 +300,7 @@ test('a subagent turn completing leaves the activity log alone', async ($, on) =
   expect(await drawnRows(ui)).toContain('│ Read a.ts')
 })
 
-test('the activity log clears when the running step changes and stays otherwise', async ($, on) => {
+test('the activity log clears when the running step changes and stays otherwise', { options: { showActivityLog: true } }, async ($, on) => {
   mockSession(on)
   mock.store(on)
   answerFileTools(on)
@@ -364,7 +364,7 @@ test('a start with todos already in state does not overwrite them from the store
   expect((await drawnRows(ui))[0]).toBe('Live')
 })
 
-test('rows are drawn without gray dimming, only the activity bar is dim', async ($, on) => {
+test('rows are drawn without gray dimming, only the activity bar is dim', { options: { showActivityLog: true } }, async ($, on) => {
   mockSession(on)
   mock.store(on)
   answerFileTools(on)
@@ -403,4 +403,115 @@ test('a parent with one subtask done and the rest pending is half-filled, not ru
   const ui = await mountSidebar($, 'terminal')
 
   expect((await drawnRows(ui))[1]).toBe('◐ Updating documentation…')
+})
+
+const SPAWN = {
+  tool_use_id: 'spawn-1',
+  prompt: 'Review the auth module',
+  description: 'Review the auth module',
+  subagentType: 'code-reviewer',
+  provider: { plugin: 'test', tier: 'user' },
+  parentModel: 'claude-sonnet-5-5',
+  background: true,
+  fork: false,
+} as const
+
+const AGENT_LIST = [
+  { id: 'a1', name: 'reviewer', description: 'Review the auth module', type: 'code-reviewer', status: 'running' },
+  { id: 'a2', description: 'Find all callers of login()', type: 'Explore', status: 'waiting' },
+  { id: 'a3', name: 'docs', description: 'Write docs', type: 'general-purpose', status: 'completed' },
+] as const
+
+test('the activity log is off by default: tool calls draw no rows', async ($, on) => {
+  mockSession(on)
+  mock.store(on)
+  answerFileTools(on)
+  await $.tool.call({ tool: SET_TODOS, todos: [...TODOS] })
+  await $.tool.call({ tool: 'Read', file_path: '/repo/a.ts' })
+  const ui = await mountSidebar($, 'terminal')
+
+  expect((await drawnRows(ui)).some(row => row.startsWith('│'))).toBe(false)
+})
+
+test('spawning an agent lists it under an Agents heading with its mark, label and type', async ($, on) => {
+  mockSession(on)
+  mock.store(on)
+  on('agent.spawn', () => ({ model: 'claude-sonnet-5-5', agentId: 'a1' }))
+  on('agent.list', () => ({ value: [...AGENT_LIST] }))
+  await $.tool.call({ tool: SET_TODOS, todos: [TODOS[1]] })
+
+  await $.agent.spawn(SPAWN)
+  const ui = await mountSidebar($, 'terminal')
+
+  expect((await drawnRows(ui)).slice(2)).toEqual([
+    'Agents',
+    '○ reviewer… code-reviewer',
+    '◐ Find all callers of login() Explore waiting',
+    '✓ docs general-purpose',
+  ])
+})
+
+test('agent marks are colored by status', async ($, on) => {
+  mockSession(on)
+  mock.store(on)
+  on('agent.spawn', () => ({ model: 'claude-sonnet-5-5', agentId: 'a1' }))
+  on('agent.list', () => ({ value: [...AGENT_LIST, { id: 'a4', description: 'Crashed', type: 'Explore', status: 'failed' }] }))
+
+  await $.agent.spawn(SPAWN)
+  const ui = await mountSidebar($, 'terminal')
+
+  const marks = (await ui.findAll({ type: 'Text' })).filter(element => ['○', '◐', '✓', '✗'].includes(element.text))
+  expect(marks.map(mark => mark.props.color)).toEqual([undefined, 'yellow', 'green', 'red'])
+})
+
+test('a finished agent stays one more turn and then drops from the list', async ($, on) => {
+  mockSession(on)
+  mock.store(on)
+  on('agent.spawn', () => ({ model: 'claude-sonnet-5-5', agentId: 'a3' }))
+  on('agent.list', () => ({ value: [AGENT_LIST[2]] }))
+  on('turn.complete', () => ({ text: 'done' }))
+  await $.agent.spawn(SPAWN)
+  const ui = await mountSidebar($, 'terminal')
+  expect(await drawnRows(ui)).toContain('✓ docs general-purpose')
+
+  await $.turn.complete(TURN_DONE)
+  expect(await drawnRows(ui)).not.toContain('✓ docs general-purpose')
+})
+
+test('a subagent finishing its turn refreshes the roster without ageing finished agents', async ($, on) => {
+  mockSession(on)
+  mock.store(on)
+  on('agent.spawn', () => ({ model: 'claude-sonnet-5-5', agentId: 'a3' }))
+  on('agent.list', () => ({ value: [AGENT_LIST[2]] }))
+  on('turn.complete', () => ({ text: 'done' }))
+  await $.agent.spawn(SPAWN)
+  const ui = await mountSidebar($, 'terminal')
+
+  await $.turn.complete({ ...TURN_DONE, agentId: 'a3' })
+  expect(await drawnRows(ui)).toContain('✓ docs general-purpose')
+})
+
+test('when rows run short the agents block keeps its rows and the activity log shrinks', { options: { showActivityLog: true } }, async ($, on) => {
+  mockSession(on)
+  mock.store(on)
+  answerFileTools(on)
+  on('agent.spawn', () => ({ model: 'claude-sonnet-5-5', agentId: 'a1' }))
+  on('agent.list', () => ({ value: [...AGENT_LIST] }))
+  await $.tool.call({ tool: SET_TODOS, todos: [TODOS[1]] })
+  await $.agent.spawn(SPAWN)
+  await $.tool.call({ tool: 'Read', file_path: '/repo/a.ts' })
+  await $.tool.call({ tool: 'Read', file_path: '/repo/b.ts' })
+  await $.tool.call({ tool: 'Read', file_path: '/repo/c.ts' })
+
+  const ui = await $.ui.mount({
+    plugin: 'todo-sidebar',
+    surface: 'terminal',
+    component: 'Pane',
+    props: { ...PANE_PROPS, scroll: { offset: 0, bodyRows: 12 } },
+    requestId: 'todo-sidebar',
+  })
+  const rows = await drawnRows(ui)
+
+  expect(rows.filter(row => row.startsWith('│'))).toEqual(['│ Read b.ts', '│ Read c.ts'])
+  expect(rows.filter(row => row.includes('code-reviewer') || row.includes('Explore') || row.includes('general-purpose'))).toHaveLength(3)
 })

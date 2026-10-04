@@ -17,12 +17,21 @@ export type ToolActivity = {
   isDone: boolean
 }
 
+export type AgentRow = {
+  id: string
+  label: string
+  type: string
+  status: 'pending' | 'running' | 'waiting' | 'idle' | 'completed' | 'failed' | 'killed'
+  turnsSinceEnd: number
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'todo-sidebar': {
       todos: TodoItem[]
       title: string | null
       toolActivity: ToolActivity[]
+      agents: AgentRow[]
     }
   }
 }

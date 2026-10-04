@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, ToolCallInput, ToolCallResult } from 'claude-code'
+import type { AgentInfo, EngineInterface, Register, ToolCallInput, ToolCallResult } from 'claude-code'
 
-import type { Step, TodoItem, TodoStatus, ToolActivity } from '../types'
+import type { AgentRow, Step, TodoItem, TodoStatus, ToolActivity } from '../types'
 
 const PANE_ID = 'todo-sidebar'
 const PANE_TITLE = 'Todos'
@@ -12,10 +12,13 @@ const ACTIVITY_ROWS = 6
 const BASH_TARGET_LENGTH = 32
 const SUBTASK_INDENT = 4
 const KEPT_SESSIONS = 20
+const ENDED_AGENT_TURNS_SHOWN = 1
+const PANE_FIXED_ROWS = 4
 
 const todos = atom({ plugin: 'todo-sidebar', key: 'todos' } as const, [])
 const title = atom({ plugin: 'todo-sidebar', key: 'title' } as const, null)
 const toolActivity = atom({ plugin: 'todo-sidebar', key: 'toolActivity' } as const, [])
+const agents = atom({ plugin: 'todo-sidebar', key: 'agents' } as const, [])
 
 const STATUSES: readonly TodoStatus[] = ['pending', 'in_progress', 'completed']
 
@@ -168,6 +171,57 @@ function isRunning(mark: StepMark): boolean {
   return mark === 'in_progress' || mark === 'partial'
 }
 
+const ENDED_AGENT_STATUSES: ReadonlySet<AgentRow['status']> = new Set(['completed', 'failed', 'killed'])
+
+const AGENT_GLYPH: Record<AgentRow['status'], string> = {
+  pending: '○',
+  running: '○',
+  waiting: '◐',
+  idle: '◐',
+  completed: '✓',
+  failed: '✗',
+  killed: '✗',
+}
+
+const AGENT_COLOR: Record<AgentRow['status'], string | undefined> = {
+  pending: undefined,
+  running: undefined,
+  waiting: 'yellow',
+  idle: 'yellow',
+  completed: 'green',
+  failed: 'red',
+  killed: 'red',
+}
+
+function hasEnded(row: AgentRow): boolean {
+  return ENDED_AGENT_STATUSES.has(row.status)
+}
+
+function toAgentRow(info: AgentInfo, previous: readonly AgentRow[]): AgentRow {
+  const known = previous.find(row => row.id === info.id)
+  return {
+    id: info.id,
+    label: info.name ?? info.description,
+    type: info.type,
+    status: info.status,
+    turnsSinceEnd: known?.turnsSinceEnd ?? 0,
+  }
+}
+
+function agentRowsFrom(listed: readonly AgentInfo[], previous: readonly AgentRow[]): AgentRow[] {
+  return listed
+    .map(info => toAgentRow(info, previous))
+    .filter(row => !hasEnded(row) || row.turnsSinceEnd < ENDED_AGENT_TURNS_SHOWN)
+}
+
+function ageEndedAgents(rows: readonly AgentRow[]): AgentRow[] {
+  return rows.map(row => (hasEnded(row) ? { ...row, turnsSinceEnd: row.turnsSinceEnd + 1 } : row))
+}
+
+function agentStatusNote(row: AgentRow): string {
+  return row.status === 'running' || row.status === 'completed' ? '' : row.status
+}
+
 function parseTitle(value: unknown): string | null {
   return typeof value === 'string' && value.trim() !== '' ? value.trim() : null
 }
@@ -239,6 +293,11 @@ async function persist($: EngineInterface): Promise<void> {
   await Promise.all(stale.map(key => $.store.delete(key)))
 }
 
+async function refreshAgents($: EngineInterface): Promise<void> {
+  const listed = await $.agent.list()
+  await update($, agents, previous => agentRowsFrom(listed, previous))
+}
+
 async function restore($: EngineInterface): Promise<void> {
   const current = await read($, todos)
   if (current.length > 0) return
@@ -248,7 +307,8 @@ async function restore($: EngineInterface): Promise<void> {
   await update($, todos, () => saved.todos)
 }
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  const isActivityLogShown = options.showActivityLog === true
   on('session.start', async ($, e, next) => {
     await restore($)
     await $.command.register({ name: OPEN_COMMAND, description: 'Open the todo sidebar' })
@@ -312,13 +372,24 @@ export const register: Register = on => {
 
   on('turn.complete', async ($, e, next) => {
     const isMainThread = e.agentId === undefined
-    if (isMainThread) await update($, toolActivity, () => [])
+    if (isMainThread) {
+      await update($, toolActivity, () => [])
+      await update($, agents, ageEndedAgents)
+    }
+    await refreshAgents($)
 
     return next(e)
   })
 
+  on('agent.spawn', async ($, e, next) => {
+    const started = await next(e)
+    await refreshAgents($)
+
+    return started
+  })
+
   on('tool.call', async ($, e, next) => {
-    if (SILENT_TOOLS.has(e.tool)) return next(e)
+    if (!isActivityLogShown || SILENT_TOOLS.has(e.tool)) return next(e)
 
     const root = await $.session.cwd()
     const id = e.tool_use_id
@@ -342,8 +413,17 @@ export const register: Register = on => {
         <Text wrap="truncate-end">{isRunning(mark) ? `${step.activeForm}…` : step.content}</Text>
       </Box>
     )
-    const [list, heading, activity] = await Promise.all([read($, todos), read($, title), read($, toolActivity)])
+    const [list, heading, activity, roster] = await Promise.all([
+      read($, todos),
+      read($, title),
+      read($, toolActivity),
+      read($, agents),
+    ])
     const verbWidth = Math.max(0, ...activity.map(row => row.verb.length))
+    const todoRows = list.reduce((count, item) => count + 1 + (item.subtasks?.length ?? 0), 0)
+    const agentRows = roster.length === 0 ? 0 : roster.length + 2
+    const activityRoom = Math.max(0, e.props.scroll.bodyRows - PANE_FIXED_ROWS - todoRows - agentRows)
+    const shownActivity = activity.slice(-activityRoom)
 
     return (
       <Box flexDirection="column" paddingX={1} paddingTop={1} gap={1}>
@@ -356,13 +436,26 @@ export const register: Register = on => {
             ])}
           </Box>
         )}
-        {activity.length > 0 && (
+        {shownActivity.length > 0 && (
           <Box flexDirection="column">
-            {activity.map(row => (
+            {shownActivity.map(row => (
               <Box flexDirection="row" gap={1}>
                 <Text dimColor>│</Text>
                 <Text>{row.verb.padEnd(verbWidth)}</Text>
                 <Text wrap="truncate-end">{row.target}</Text>
+              </Box>
+            ))}
+          </Box>
+        )}
+        {roster.length > 0 && (
+          <Box flexDirection="column">
+            <Text bold>Agents</Text>
+            {roster.map(row => (
+              <Box flexDirection="row" gap={1}>
+                <Text color={AGENT_COLOR[row.status]}>{AGENT_GLYPH[row.status]}</Text>
+                <Text wrap="truncate-end">{row.status === 'running' ? `${row.label}…` : row.label}</Text>
+                <Text>{row.type}</Text>
+                {agentStatusNote(row) !== '' && <Text>{agentStatusNote(row)}</Text>}
               </Box>
             ))}
           </Box>

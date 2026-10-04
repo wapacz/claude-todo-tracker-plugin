@@ -8,5 +8,13 @@
     "url": "https://github.com/wapacz"
   },
   "repository": "https://github.com/wapacz/claude-todo-tracker-plugin",
-  "license": "MIT"
+  "license": "MIT",
+  "userConfig": {
+    "showActivityLog": {
+      "type": "boolean",
+      "description": "Show the tool calls made while the running step is worked on (Read, Edit, Run) under the todo list",
+      "default": false,
+      "title": "Show activity log"
+    }
+  }
 }

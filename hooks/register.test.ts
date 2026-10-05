@@ -554,7 +554,7 @@ test('when rows run short the agents block keeps its rows and the activity log s
     plugin: 'todo-sidebar',
     surface: 'terminal',
     component: 'Pane',
-    props: { ...PANE_PROPS, scroll: { offset: 0, bodyRows: 12 } },
+    props: { ...PANE_PROPS, scroll: { offset: 0, bodyRows: 13 } },
     requestId: 'todo-sidebar',
   })
   const rows = await drawnRows(ui)
@@ -1098,4 +1098,43 @@ test('a resumed session keeps the keeper from reading messages it already checke
   expect(keeperPrompts).toHaveLength(1)
   expect(keeperPrompts[0]).not.toContain('old question')
   expect(keeperPrompts[0]).toContain('user: new question')
+})
+
+const LONG_STEP = 'Migrated every preprocessing job definition to the new pipeline schema'
+
+test('long todo and agent texts wrap instead of being cut off', async ($, on) => {
+  mockSession(on)
+  mock.store(on)
+  on('agent.spawn', () => ({ model: 'claude-sonnet-5-5', agentId: 'a1' }))
+  on('agent.list', () => ({ value: [...AGENT_LIST] }))
+  await $.tool.call({ tool: SET_TODOS, todos: [{ content: LONG_STEP, status: 'completed', activeForm: 'Migrating' }] })
+  await $.agent.spawn(SPAWN)
+
+  for (const surface of SURFACES) {
+    const ui = await mountSidebar($, surface)
+    const texts = await ui.findAll({ type: 'Text' })
+
+    expect(texts.some(text => text.props.wrap === 'truncate-end')).toBe(false)
+    expect((await drawnRows(ui)).some(row => row.includes(LONG_STEP))).toBe(true)
+  }
+})
+
+test('a todo that wraps onto more lines leaves fewer lines for the activity log', { options: { showActivityLog: true } }, async ($, on) => {
+  mockSession(on)
+  mock.store(on)
+  answerFileTools(on)
+  await $.tool.call({ tool: SET_TODOS, todos: [{ content: LONG_STEP, status: 'pending', activeForm: 'Migrating' }] })
+  await $.tool.call({ tool: 'Read', file_path: '/repo/a.ts' })
+  await $.tool.call({ tool: 'Read', file_path: '/repo/b.ts' })
+  await $.tool.call({ tool: 'Read', file_path: '/repo/c.ts' })
+
+  const ui = await $.ui.mount({
+    plugin: 'todo-sidebar',
+    surface: 'terminal',
+    component: 'Pane',
+    props: { ...PANE_PROPS, scroll: { offset: 0, bodyRows: 9 } },
+    requestId: 'todo-sidebar',
+  })
+
+  expect((await drawnRows(ui)).filter(row => row.startsWith('│'))).toEqual(['│ Read b.ts', '│ Read c.ts'])
 })

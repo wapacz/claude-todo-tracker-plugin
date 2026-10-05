@@ -21,7 +21,9 @@ const BASH_TARGET_LENGTH = 32
 const SUBTASK_INDENT = 4
 const KEPT_SESSIONS = 20
 const ENDED_AGENT_TURNS_SHOWN = 1
-const PANE_FIXED_ROWS = 4
+const PANE_FIXED_ROWS = 3
+const PANE_PADDING_X = 1
+const MARK_COLUMNS = 2
 const SUMMARY_BULLETS = 3
 const EXCERPT_MESSAGE_CHARS = 600
 const EXCERPT_CHARS = 12000
@@ -293,6 +295,47 @@ function visibleSubtasks(item: TodoItem, expanded: readonly string[]): Step[] {
 
 function agentStatusNote(row: AgentRow): string {
   return row.status === 'running' || row.status === 'completed' ? '' : row.status
+}
+
+function stepText(step: Step, mark: StepMark): string {
+  return isRunning(mark) ? `${step.activeForm}…` : step.content
+}
+
+function agentLabel(row: AgentRow): string {
+  return row.status === 'running' ? `${row.label}…` : row.label
+}
+
+function toggleLabel(item: TodoItem, expanded: readonly string[]): string {
+  return isExpanded(item, expanded) ? '▾' : `▸ ${item.subtasks?.length ?? 0}`
+}
+
+function newestThatFit<T>(rows: readonly T[], linesOf: (row: T) => number, room: number): T[] {
+  const kept: T[] = []
+  let used = 0
+  for (const row of [...rows].reverse()) {
+    used += linesOf(row)
+    if (used > room) break
+    kept.unshift(row)
+  }
+  return kept
+}
+
+// Mirrors the terminal's word wrap so the activity log is budgeted by the lines rows really take, not by row count.
+function wrappedLineCount(text: string, width: number): number {
+  const columns = Math.max(1, width)
+  let lines = 1
+  let lineLength = 0
+  for (const word of text.split(' ')) {
+    const joined = lineLength === 0 ? word.length : lineLength + 1 + word.length
+    if (joined <= columns) {
+      lineLength = joined
+      continue
+    }
+    const spill = Math.max(1, Math.ceil(word.length / columns))
+    lines += (lineLength === 0 ? 0 : 1) + spill - 1
+    lineLength = word.length - (spill - 1) * columns
+  }
+  return lines
 }
 
 function parseTitle(value: unknown): string | null {
@@ -749,26 +792,44 @@ export const register: Register = (on, options) => {
     const drawStep = (step: Step, mark: StepMark, indent: number, toggle?: { key: string; item: TodoItem }) => (
       <Box flexDirection="row" gap={1} paddingLeft={indent}>
         <Text color={MARK_COLOR[mark]}>{MARK_GLYPH[mark]}</Text>
-        <Text wrap="truncate-end">{isRunning(mark) ? `${step.activeForm}…` : step.content}</Text>
+        <Text wrap="wrap">{stepText(step, mark)}</Text>
         {toggle !== undefined && (
           <Button
             key={toggle.key}
             plain
-            label={isExpanded(toggle.item, expanded) ? '▾' : `▸ ${toggle.item.subtasks?.length ?? 0}`}
+            label={toggleLabel(toggle.item, expanded)}
             onPress={() => void update($, expandedParents, current => toggled(current, toggle.item.content))}
           />
         )}
       </Box>
     )
+    const width = e.props.bodyColumns - 2 * PANE_PADDING_X
     const verbWidth = Math.max(0, ...activity.map(row => row.verb.length))
-    const todoRows = list.reduce((count, item) => count + 1 + visibleSubtasks(item, expanded).length, 0)
-    const agentRows = roster.length === 0 ? 0 : roster.length + 2
-    const summaryRows = digest.bullets.length === 0 ? 0 : digest.bullets.length + 2
-    const activityRoom = Math.max(0, e.props.scroll.bodyRows - PANE_FIXED_ROWS - summaryRows - todoRows - agentRows)
-    const shownActivity = activity.slice(-activityRoom)
+    const stepLines = (step: Step, mark: StepMark, indent: number, toggle = '') =>
+      wrappedLineCount(stepText(step, mark), width - indent - MARK_COLUMNS - (toggle === '' ? 0 : toggle.length + 1))
+    const todoRows = list.reduce(
+      (count, item) =>
+        count +
+        stepLines(item, markOf(item), 0, canCollapse(item) ? toggleLabel(item, expanded) : '') +
+        visibleSubtasks(item, expanded).reduce((sum, step) => sum + stepLines(step, markOfStep(step, step.status), SUBTASK_INDENT), 0),
+      0,
+    )
+    const agentLines = (row: AgentRow) => {
+      const note = agentStatusNote(row)
+      const trailing = row.type.length + 1 + (note === '' ? 0 : note.length + 1)
+      return wrappedLineCount(agentLabel(row), width - MARK_COLUMNS - trailing)
+    }
+    const agentRows = roster.length === 0 ? 0 : roster.reduce((sum, row) => sum + agentLines(row), 0) + 2
+    const summaryLines = digest.bullets.reduce((sum, bullet) => sum + wrappedLineCount(bullet, width - MARK_COLUMNS), 0)
+    const summaryRows = digest.bullets.length === 0 ? 0 : summaryLines + 2
+    const headingText = heading ?? (list.length === 0 ? 'No todos yet.' : summarize(list))
+    const headingRows = wrappedLineCount(headingText, width)
+    const activityLines = (row: ToolActivity) => wrappedLineCount(row.target, width - MARK_COLUMNS - verbWidth - 1)
+    const activityRoom = Math.max(0, e.props.scroll.bodyRows - PANE_FIXED_ROWS - headingRows - summaryRows - todoRows - agentRows)
+    const shownActivity = newestThatFit(activity, activityLines, activityRoom)
 
     return (
-      <Box flexDirection="column" paddingX={1} paddingTop={1} gap={1}>
+      <Box flexDirection="column" paddingX={PANE_PADDING_X} paddingTop={1} gap={1}>
         {digest.bullets.length > 0 && (
           <Box flexDirection="column">
             <Text bold>Summary</Text>
@@ -780,7 +841,7 @@ export const register: Register = (on, options) => {
             ))}
           </Box>
         )}
-        <Text bold>{heading ?? (list.length === 0 ? 'No todos yet.' : summarize(list))}</Text>
+        <Text bold>{headingText}</Text>
         {list.length > 0 && (
           <Box flexDirection="column">
             {list.flatMap((item, index) => [
@@ -795,7 +856,7 @@ export const register: Register = (on, options) => {
               <Box flexDirection="row" gap={1}>
                 <Text dimColor>│</Text>
                 <Text>{row.verb.padEnd(verbWidth)}</Text>
-                <Text wrap="truncate-end">{row.target}</Text>
+                <Text wrap="wrap">{row.target}</Text>
               </Box>
             ))}
           </Box>
@@ -806,7 +867,7 @@ export const register: Register = (on, options) => {
             {roster.map(row => (
               <Box flexDirection="row" gap={1}>
                 <Text color={AGENT_COLOR[row.status]}>{AGENT_GLYPH[row.status]}</Text>
-                <Text wrap="truncate-end">{row.status === 'running' ? `${row.label}…` : row.label}</Text>
+                <Text wrap="wrap">{agentLabel(row)}</Text>
                 <Text>{row.type}</Text>
                 {agentStatusNote(row) !== '' && <Text>{agentStatusNote(row)}</Text>}
               </Box>

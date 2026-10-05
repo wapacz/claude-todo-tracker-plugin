@@ -41,6 +41,7 @@ declare module 'claude-code' {
       agents: AgentRow[]
       expandedParents: string[]
       summary: SessionSummary
+      keeperCoveredMessages: number
     }
   }
 }

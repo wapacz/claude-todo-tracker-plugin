@@ -24,9 +24,15 @@
     },
     "summaryModel": {
       "type": "string",
-      "title": "Summary model",
-      "description": "Model alias or id used for the session summary (cheap is fine)",
+      "title": "Helper model",
+      "description": "Model alias or id used for the session summary and the status keeper (cheap is fine)",
       "default": "haiku"
+    },
+    "statusKeeper": {
+      "type": "boolean",
+      "title": "Status keeper",
+      "description": "After a response in which the agent did not update the todo list, ask the helper model which step statuses changed",
+      "default": true
     }
   }
 }

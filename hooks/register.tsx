@@ -1,5 +1,13 @@
 import { atom, read, update } from 'claude-code'
-import type { AgentInfo, EngineInterface, Register, ToolCallInput, ToolCallResult } from 'claude-code'
+import type {
+  AgentInfo,
+  EngineInterface,
+  Register,
+  SessionMessage,
+  ToolCallInput,
+  ToolCallResult,
+  ToolUseSummary,
+} from 'claude-code'
 
 import type { AgentRow, SessionSummary, Step, TodoItem, TodoStatus, ToolActivity } from '../types'
 
@@ -15,10 +23,14 @@ const KEPT_SESSIONS = 20
 const ENDED_AGENT_TURNS_SHOWN = 1
 const PANE_FIXED_ROWS = 4
 const SUMMARY_BULLETS = 3
-const SUMMARY_MESSAGE_CHARS = 600
-const SUMMARY_PROMPT_CHARS = 12000
+const EXCERPT_MESSAGE_CHARS = 600
+const EXCERPT_CHARS = 12000
 const SUMMARY_TIMEOUT_MS = 10000
 const SUMMARY_SAME = 'SAME'
+const KEEPER_TIMEOUT_MS = 10000
+const TOOL_USE_TARGET_LENGTH = 60
+const SET_TODOS_TOOL_ID = 'mcp__todo-sidebar__set_todos'
+const TODO_WRITERS = new Set([SET_TODOS_TOOL_ID, 'TodoWrite'])
 
 const todos = atom({ plugin: 'todo-sidebar', key: 'todos' } as const, [])
 const title = atom({ plugin: 'todo-sidebar', key: 'title' } as const, null)
@@ -27,10 +39,11 @@ const agents = atom({ plugin: 'todo-sidebar', key: 'agents' } as const, [])
 const expandedParents = atom({ plugin: 'todo-sidebar', key: 'expandedParents' } as const, [])
 const EMPTY_SUMMARY: SessionSummary = { bullets: [], coveredMessages: 0, checkedAtTurn: 0 }
 const summary = atom({ plugin: 'todo-sidebar', key: 'summary' } as const, EMPTY_SUMMARY)
+const keeperCoveredMessages = atom({ plugin: 'todo-sidebar', key: 'keeperCoveredMessages' } as const, 0)
 
 const STATUSES: readonly TodoStatus[] = ['pending', 'in_progress', 'completed']
 
-const SILENT_TOOLS = new Set(['TodoWrite', 'mcp__todo-sidebar__set_todos', 'ToolSearch'])
+const SILENT_TOOLS = new Set([...TODO_WRITERS, 'ToolSearch'])
 
 const TOOL_VERB: Record<string, string> = {
   Bash: 'Run',
@@ -295,9 +308,11 @@ function runningStepOf(list: readonly TodoItem[]): string | null {
   return child === undefined ? parent.content : `${parent.content} > ${child.content}`
 }
 
-type SavedList = { title: string | null; todos: TodoItem[]; summary?: SessionSummary }
+type SavedList = { title: string | null; todos: TodoItem[]; summary?: SessionSummary; keeperCoveredMessages?: number }
 
 type SummaryPolicy = { everyPrompts: number; model: string }
+
+type KeeperPolicy = { isEnabled: boolean; model: string }
 
 const SUMMARY_SYSTEM =
   'You keep a running summary of a coding session for the person driving it, shown in a sidebar. ' +
@@ -314,19 +329,108 @@ function parseSummary(value: unknown): SessionSummary {
   return isValid ? { bullets: bullets as string[], coveredMessages, checkedAtTurn } : EMPTY_SUMMARY
 }
 
-function summaryPrompt(bullets: readonly string[], messages: readonly { role: string; text: string }[]): string {
-  const current = bullets.length === 0 ? '(none yet)' : bullets.map(b => `- ${b}`).join('\n')
-  const lines: string[] = []
+type ExcerptOptions = { isToolUseShown: boolean; isNewestKept: boolean }
+
+const SUMMARY_EXCERPT: ExcerptOptions = { isToolUseShown: false, isNewestKept: false }
+// Status depends on what happened last and on what the agent actually ran, not on what it said.
+const KEEPER_EXCERPT: ExcerptOptions = { isToolUseShown: true, isNewestKept: true }
+
+const TOOL_USE_TARGET_KEYS = ['file_path', 'notebook_path', 'command', 'description', 'skill', 'pattern'] as const
+
+function toolUseLine(use: ToolUseSummary): string {
+  const key = TOOL_USE_TARGET_KEYS.find(one => typeof use.input[one] === 'string')
+  const target = key === undefined ? '' : String(use.input[key]).replace(/\s+/g, ' ').slice(0, TOOL_USE_TARGET_LENGTH)
+  const outcome = use.isError === true ? ' (failed)' : ''
+  return `${shortVerb(use.tool)} ${target}`.trimEnd() + outcome
+}
+
+function excerptLines(message: SessionMessage, isToolUseShown: boolean): string[] {
+  const text = message.text.replace(/\s+/g, ' ').trim().slice(0, EXCERPT_MESSAGE_CHARS)
+  const lines = text === '' ? [] : [`${message.role}: ${text}`]
+  if (!isToolUseShown) return lines
+  return [...lines, ...message.toolUses.map(use => `${message.role} used ${toolUseLine(use)}`)]
+}
+
+function transcriptExcerpt(messages: readonly SessionMessage[], options: ExcerptOptions): string {
+  const lines = messages.flatMap(message => excerptLines(message, options.isToolUseShown))
+  const ordered = options.isNewestKept ? [...lines].reverse() : lines
+  const kept: string[] = []
   let used = 0
-  for (const message of messages) {
-    const text = message.text.replace(/\s+/g, ' ').trim().slice(0, SUMMARY_MESSAGE_CHARS)
-    if (text === '') continue
-    const line = `${message.role}: ${text}`
-    if (used + line.length > SUMMARY_PROMPT_CHARS) break
-    lines.push(line)
+  for (const line of ordered) {
+    if (used + line.length > EXCERPT_CHARS) break
+    kept.push(line)
     used += line.length
   }
-  return `Current bullets:\n${current}\n\nNew messages:\n${lines.join('\n')}`
+  return (options.isNewestKept ? kept.reverse() : kept).join('\n')
+}
+
+function summaryPrompt(bullets: readonly string[], messages: readonly SessionMessage[]): string {
+  const current = bullets.length === 0 ? '(none yet)' : bullets.map(b => `- ${b}`).join('\n')
+  return `Current bullets:\n${current}\n\nNew messages:\n${transcriptExcerpt(messages, SUMMARY_EXCERPT)}`
+}
+
+const KEEPER_SYSTEM =
+  'You keep the step statuses of a todo list shown to the person driving a coding session. ' +
+  'You get the numbered list and the messages since the last check, with the tools the assistant used. ' +
+  'Answer one JSON object mapping a step number to its new status (pending, in_progress, completed), ' +
+  'only for steps whose status changed, e.g. {"2": "completed", "3.1": "in_progress"}. Answer {} when nothing changed. ' +
+  'Mark a step completed only when the messages show it was done; a user step is done once the user says so. ' +
+  'Keep at most one step in_progress. Never add, remove or rename steps. No prose.'
+
+type StatusChanges = Record<string, TodoStatus>
+
+function numberedStep(step: Step, number: string): string {
+  const owner = step.isForUser ? ' (user step)' : ''
+  return `${number} [${step.status}]${owner} ${step.content}`
+}
+
+function numberedList(list: readonly TodoItem[]): string {
+  return list
+    .flatMap((item, index) => [
+      numberedStep(item, `${index + 1}`),
+      ...(item.subtasks ?? []).map((step, subIndex) => numberedStep(step, `${index + 1}.${subIndex + 1}`)),
+    ])
+    .join('\n')
+}
+
+function keeperPrompt(list: readonly TodoItem[], messages: readonly SessionMessage[]): string {
+  return `Todo list:\n${numberedList(list)}\n\nNew messages:\n${transcriptExcerpt(messages, KEEPER_EXCERPT)}`
+}
+
+function parseJsonObject(text: string): unknown {
+  const found = text.match(/\{[\s\S]*\}/)
+  if (found === null) return {}
+  try {
+    return JSON.parse(found[0])
+  } catch {
+    return {}
+  }
+}
+
+// A reply haiku garbled reads as no change, so the list is never worse than before the check.
+function parseStatusChanges(reply: string): StatusChanges {
+  const parsed = parseJsonObject(reply)
+  if (typeof parsed !== 'object' || parsed === null) return {}
+  const entries = Object.entries(parsed).filter((entry): entry is [string, TodoStatus] => isTodoStatus(entry[1]))
+  return Object.fromEntries(entries)
+}
+
+function withStatusChanges(list: readonly TodoItem[], changes: StatusChanges): TodoItem[] {
+  return list.map((item, index) => {
+    const number = `${index + 1}`
+    const status = changes[number] ?? item.status
+    if (item.subtasks === undefined) return { ...item, status }
+    const subtasks = item.subtasks.map((step, subIndex) => ({ ...step, status: changes[`${number}.${subIndex + 1}`] ?? step.status }))
+    return { ...item, status, subtasks }
+  })
+}
+
+function hasAgentWrittenTodos(messages: readonly SessionMessage[]): boolean {
+  return messages.some(message => message.toolUses.some(use => TODO_WRITERS.has(use.tool)))
+}
+
+function isSameList(one: readonly TodoItem[], other: readonly TodoItem[]): boolean {
+  return JSON.stringify(one) === JSON.stringify(other)
 }
 
 function appendBullet(bullets: readonly string[], reply: string): string[] {
@@ -347,11 +451,17 @@ function savedStepToInput(value: unknown): unknown {
 
 function parseSaved(value: unknown): SavedList | null {
   if (typeof value !== 'object' || value === null) return null
-  const { title: savedTitle, todos: savedTodos, summary: savedSummary } = value as Record<string, unknown>
+  const { title: savedTitle, todos: savedTodos, summary: savedSummary, keeperCoveredMessages: savedCovered } =
+    value as Record<string, unknown>
   if (!Array.isArray(savedTodos)) return null
   const parsed = parseTodos(savedTodos.map(savedStepToInput))
   if (!parsed.success) return null
-  return { title: parseTitle(savedTitle), todos: parsed.todos, summary: parseSummary(savedSummary) }
+  return {
+    title: parseTitle(savedTitle),
+    todos: parsed.todos,
+    summary: parseSummary(savedSummary),
+    keeperCoveredMessages: typeof savedCovered === 'number' ? savedCovered : 0,
+  }
 }
 
 function completedCopy(steps: readonly Step[]): Step[] {
@@ -421,8 +531,13 @@ async function storeKeyOf($: EngineInterface): Promise<string> {
 }
 
 async function persist($: EngineInterface): Promise<void> {
-  const [heading, list, digest] = await Promise.all([read($, title), read($, todos), read($, summary)])
-  const saved: SavedList = { title: heading, todos: list, summary: digest }
+  const [heading, list, digest, keeperCovered] = await Promise.all([
+    read($, title),
+    read($, todos),
+    read($, summary),
+    read($, keeperCoveredMessages),
+  ])
+  const saved: SavedList = { title: heading, todos: list, summary: digest, keeperCoveredMessages: keeperCovered }
   await $.store.set(await storeKeyOf($), saved)
   const stale = (await $.store.keys()).filter(key => key.startsWith('session:')).slice(0, -KEPT_SESSIONS)
   await Promise.all(stale.map(key => $.store.delete(key)))
@@ -441,6 +556,37 @@ async function restore($: EngineInterface): Promise<void> {
   await update($, title, () => saved.title)
   await update($, todos, () => saved.todos)
   await update($, summary, () => saved.summary ?? EMPTY_SUMMARY)
+  await update($, keeperCoveredMessages, () => saved.keeperCoveredMessages ?? 0)
+}
+
+async function markKeeperCovered($: EngineInterface, count: number): Promise<void> {
+  await update($, keeperCoveredMessages, () => count)
+  await persist($)
+}
+
+// The agent's own set_todos knows the plan best, so the keeper only steps in on turns the agent skipped it.
+async function keepStatuses($: EngineInterface, policy: KeeperPolicy): Promise<void> {
+  const [list, covered, messages] = await Promise.all([read($, todos), read($, keeperCoveredMessages), $.session.messages()])
+  const fresh = messages.slice(covered)
+  if (fresh.length === 0) return
+  if (list.length === 0 || hasAgentWrittenTodos(fresh)) return markKeeperCovered($, messages.length)
+  const reply = await $.model.complete({
+    model: policy.model,
+    system: KEEPER_SYSTEM,
+    prompt: keeperPrompt(list, fresh),
+    maxTokens: 200,
+    effort: 'low',
+    timeoutMs: KEEPER_TIMEOUT_MS,
+  })
+  if (!reply.isAnswered) return
+  // Step numbers point into the list haiku saw; a list the agent rewrote meanwhile would take them to other rows.
+  const isListUnchanged = isSameList(await read($, todos), list)
+  if (isListUnchanged) await update($, todos, () => withStatusChanges(list, parseStatusChanges(reply.text)))
+  await markKeeperCovered($, messages.length)
+}
+
+function keepStatusesInBackground($: EngineInterface, policy: KeeperPolicy): void {
+  void keepStatuses($, policy).catch(() => undefined)
 }
 
 async function refreshSummary($: EngineInterface, policy: SummaryPolicy): Promise<void> {
@@ -479,10 +625,12 @@ async function isSummaryDue($: EngineInterface, policy: SummaryPolicy): Promise<
 
 export const register: Register = (on, options) => {
   const isActivityLogShown = options.showActivityLog === true
+  const helperModel = typeof options.summaryModel === 'string' && options.summaryModel !== '' ? options.summaryModel : 'haiku'
   const summaryPolicy: SummaryPolicy = {
     everyPrompts: typeof options.summaryEveryPrompts === 'number' ? options.summaryEveryPrompts : 6,
-    model: typeof options.summaryModel === 'string' && options.summaryModel !== '' ? options.summaryModel : 'haiku',
+    model: helperModel,
   }
+  const keeperPolicy: KeeperPolicy = { isEnabled: options.statusKeeper !== false, model: helperModel }
   on('session.start', async ($, e, next) => {
     await restore($)
     if (await isSummaryDue($, summaryPolicy)) refreshSummaryInBackground($, summaryPolicy)
@@ -521,7 +669,7 @@ export const register: Register = (on, options) => {
     return { text: `Example list of ${DEMO_TODOS.length} todos shown in the sidebar.` }
   })
 
-  on('tool.call', { tool: 'mcp__todo-sidebar__set_todos' }, async ($, e) => {
+  on('tool.call', { tool: SET_TODOS_TOOL_ID }, async ($, e) => {
     const parsed = parseTodos(e.todos)
     if (!parsed.success) return { deny: `set_todos: ${parsed.error}` }
 
@@ -557,6 +705,7 @@ export const register: Register = (on, options) => {
       await update($, toolActivity, () => [])
       await update($, agents, ageEndedAgents)
       if (await isSummaryDue($, summaryPolicy)) refreshSummaryInBackground($, summaryPolicy)
+      if (keeperPolicy.isEnabled) keepStatusesInBackground($, keeperPolicy)
     }
     await refreshAgents($)
 

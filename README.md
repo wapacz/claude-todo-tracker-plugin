@@ -35,6 +35,12 @@ Implement OAuth scopes
   `TodoWrite` tool where a session has it. The list is written for the person, not the model:
   outcomes in plain words, and steps only the person can take carry `forUser: true` and are
   drawn with a yellow flag until done.
+- Keeps the statuses current when the agent forgets. After a response in which the agent did not
+  update the list, the same cheap model gets the numbered list, the new messages and the tools the
+  agent ran, and answers which step statuses changed. It never adds, removes or renames a row, and a
+  reply it garbles changes nothing. When the agent rewrites the list while the model is still
+  thinking, the answer is dropped. Set `statusKeeper` to false in the plugin config to turn it off;
+  `summaryModel` picks the model for both.
 - Saves the list per session and restores it when the session is resumed.
 - Keeps a finished row's subtasks when a later call resends the row without them, matched by the
   same text or the same position in a list of the same length, so finished detail is not lost to a

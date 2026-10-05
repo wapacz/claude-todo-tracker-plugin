@@ -70,27 +70,37 @@ function mockSession(on: On): void {
   on('session.messages', () => ({ value: [] }))
 }
 
-type Conversation = { turns: number; messages: { role: 'user' | 'assistant'; text: string; toolUses: never[] }[] }
+type ToolUse = { tool_use_id: string; tool: string; input: Record<string, unknown>; isError?: true }
+type ChatMessage = { role: 'user' | 'assistant'; text: string; toolUses: ToolUse[] }
+type Conversation = { turns: number; messages: ChatMessage[] }
+type MockedConversation = { chat: Conversation; prompts: string[]; models: string[]; keeperPrompts: string[] }
 
-function mockConversation(on: On, replies: readonly string[]): { chat: Conversation; prompts: string[]; models: string[] } {
+function modelReply(queue: string[]) {
+  const text = queue.shift()
+  return text === undefined
+    ? { value: { isAnswered: false, reason: 'empty-reply', usage: USAGE } as const }
+    : { value: { isAnswered: true, text, usage: USAGE } as const }
+}
+
+function mockConversation(on: On, replies: readonly string[], keeperReplies: readonly string[] = []): MockedConversation {
   const chat: Conversation = { turns: 0, messages: [] }
   const prompts: string[] = []
   const models: string[] = []
-  const queue = [...replies]
+  const keeperPrompts: string[] = []
+  const summaryQueue = [...replies]
+  const keeperQueue = [...keeperReplies]
   on('session.cwd', () => ({ value: '/repo' }))
   on('session.id', () => ({ value: 'session-1' }))
   on('session.turns', () => ({ value: chat.turns }))
   on('session.messages', () => ({ value: [...chat.messages] }))
   on('agent.list', () => ({ value: [] }))
   on('model.complete', (_, e) => {
-    prompts.push(e.prompt)
     models.push(e.model)
-    const text = queue.shift()
-    return text === undefined
-      ? { value: { isAnswered: false, reason: 'empty-reply', usage: USAGE } }
-      : { value: { isAnswered: true, text, usage: USAGE } }
+    const isKeeper = e.prompt.startsWith('Todo list:')
+    ;(isKeeper ? keeperPrompts : prompts).push(e.prompt)
+    return modelReply(isKeeper ? keeperQueue : summaryQueue)
   })
-  return { chat, prompts, models }
+  return { chat, prompts, models, keeperPrompts }
 }
 
 const USAGE = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
@@ -373,7 +383,9 @@ test('set_todos saves the list under the session id', async ($, on) => {
 
   const saved = TODOS.map(step => ({ ...step, isForUser: false }))
   const summary = { bullets: [], coveredMessages: 0, checkedAtTurn: 0 }
-  expect(writes).toEqual([{ key: 'session:session-1', value: { title: 'Saved', todos: saved, summary } }])
+  expect(writes).toEqual([
+    { key: 'session:session-1', value: { title: 'Saved', todos: saved, summary, keeperCoveredMessages: 0 } },
+  ])
 })
 
 test('a resumed session restores the saved list on start', async ($, on) => {
@@ -738,6 +750,33 @@ test('the first turn end asks the summary model and draws its bullet above the t
   expect(prompts[0]).toContain('user: create a sidebar plugin')
 })
 
+test('the transcript excerpt collapses whitespace, skips empty messages and cuts long ones', async ($, on) => {
+  const { chat, prompts } = mockConversation(on, ['SAME'])
+  mock.store(on)
+  on('turn.complete', () => ({ text: 'done' }))
+  say(chat, 'line one\n\n   line two', '   ')
+  say(chat, 'x'.repeat(700), 'ok')
+
+  await $.turn.complete(TURN_DONE)
+
+  const excerpt = prompts[0]?.split('New messages:\n')[1]
+  expect(excerpt).toBe(`user: line one line two\nuser: ${'x'.repeat(600)}\nassistant: ok`)
+})
+
+test('the transcript excerpt stops before it outgrows its character budget', async ($, on) => {
+  const { chat, prompts } = mockConversation(on, ['SAME'])
+  mock.store(on)
+  on('turn.complete', () => ({ text: 'done' }))
+  for (let i = 0; i < 25; i += 1) say(chat, `${i}`.padEnd(600, '.'), 'ok')
+
+  await $.turn.complete(TURN_DONE)
+
+  const excerpt = prompts[0]?.split('New messages:\n')[1] ?? ''
+  expect(excerpt.length).toBeLessThanOrEqual(12000)
+  expect(excerpt).toContain('user: 0.')
+  expect(excerpt).not.toContain('user: 24.')
+})
+
 test('the model is asked again only after six more prompts, and SAME keeps the bullets', async ($, on) => {
   const { chat, prompts } = mockConversation(on, ['Built the sidebar', 'SAME', 'Moved on to publishing'])
   mock.store(on)
@@ -866,4 +905,197 @@ test('markdown markers are stripped from titles, rows and summary bullets', asyn
     '○ Editing src/auth.ts…',
     '○ Keep 2*3 and snake_case_name as they are',
   ])
+})
+
+const KEEPER_TODOS = [
+  { content: 'Wrote the parser', status: 'completed' },
+  { content: 'Write the renderer', status: 'in_progress', activeForm: 'Writing the renderer' },
+  {
+    content: 'Ship it',
+    status: 'pending',
+    subtasks: [
+      { content: 'Approve the release', status: 'pending', forUser: true },
+      { content: 'Publish the package', status: 'pending', activeForm: 'Publishing the package' },
+    ],
+  },
+] as const
+
+function act(chat: Conversation, user: string, assistant: string, toolUses: ToolUse[]): void {
+  chat.turns += 1
+  chat.messages.push({ role: 'user', text: user, toolUses: [] }, { role: 'assistant', text: assistant, toolUses })
+}
+
+function edited(file: string): ToolUse {
+  return { tool_use_id: `edit-${file}`, tool: 'Edit', input: { file_path: file } }
+}
+
+async function startKeeperList($: Engine): Promise<void> {
+  await $.tool.call({ tool: SET_TODOS, title: 'Renderer', todos: [...KEEPER_TODOS] })
+}
+
+test('a turn without set_todos asks the keeper, who sees the numbered list and the tools the agent ran', async ($, on) => {
+  const { chat, keeperPrompts } = mockConversation(on, ['SAME'], ['{"2": "completed", "3.2": "in_progress"}'])
+  mock.store(on)
+  on('turn.complete', () => ({ text: 'done' }))
+  await startKeeperList($)
+  act(chat, 'finish the renderer', 'Renderer done, publishing next.', [edited('src/render.ts')])
+
+  await $.turn.complete(TURN_DONE)
+  const ui = await mountSidebar($, 'terminal')
+
+  expect(keeperPrompts).toHaveLength(1)
+  expect(keeperPrompts[0]).toContain('2 [in_progress] Write the renderer')
+  expect(keeperPrompts[0]).toContain('3.1 [pending] (user step) Approve the release')
+  expect(keeperPrompts[0]).toContain('assistant used Edit src/render.ts')
+  expect((await drawnRows(ui)).slice(-5)).toEqual([
+    '✓ Wrote the parser',
+    '✓ Write the renderer',
+    '◐ Ship it…',
+    '    ⚑ Approve the release',
+    '    ○ Publishing the package…',
+  ])
+})
+
+test('the keeper can tick off a user step once the user says it is done', async ($, on) => {
+  const { chat } = mockConversation(on, ['SAME'], ['{"3.1": "completed"}'])
+  mock.store(on)
+  on('turn.complete', () => ({ text: 'done' }))
+  await startKeeperList($)
+  act(chat, 'ok, release approved', 'Thanks.', [])
+
+  await $.turn.complete(TURN_DONE)
+  const ui = await mountSidebar($, 'terminal')
+
+  expect((await drawnRows(ui))).toContain('    ✓ Approve the release')
+})
+
+test('a turn in which the agent wrote the list itself is skipped and not read again later', async ($, on) => {
+  const { chat, keeperPrompts } = mockConversation(on, ['SAME'], ['{}'])
+  mock.store(on)
+  on('turn.complete', () => ({ text: 'done' }))
+  await startKeeperList($)
+  act(chat, 'go', 'Planned it.', [{ tool_use_id: 's1', tool: SET_TODOS, input: {} }])
+  await $.turn.complete(TURN_DONE)
+  expect(keeperPrompts).toHaveLength(0)
+
+  act(chat, 'next', 'Working on it.', [])
+  await $.turn.complete(TURN_DONE)
+
+  expect(keeperPrompts).toHaveLength(1)
+  expect(keeperPrompts[0]).not.toContain('Planned it.')
+  expect(keeperPrompts[0]).toContain('assistant: Working on it.')
+})
+
+test('the keeper stays quiet while the list is empty', async ($, on) => {
+  const { chat, keeperPrompts } = mockConversation(on, ['SAME'])
+  mock.store(on)
+  on('turn.complete', () => ({ text: 'done' }))
+  act(chat, 'hi', 'hello', [])
+
+  await $.turn.complete(TURN_DONE)
+
+  expect(keeperPrompts).toHaveLength(0)
+})
+
+test('a garbled keeper reply, unknown step numbers and unknown statuses change nothing', async ($, on) => {
+  const replies = ['Sure! The renderer is done.', '{"9": "completed", "2": "finished"}']
+  const { chat, keeperPrompts } = mockConversation(on, ['SAME'], replies)
+  mock.store(on)
+  on('turn.complete', () => ({ text: 'done' }))
+  await startKeeperList($)
+  const ui = await mountSidebar($, 'terminal')
+  const before = await drawnRows(ui)
+
+  act(chat, 'a', 'b', [])
+  await $.turn.complete(TURN_DONE)
+  act(chat, 'c', 'd', [])
+  await $.turn.complete(TURN_DONE)
+
+  expect(keeperPrompts).toHaveLength(2)
+  expect(await drawnRows(ui)).toEqual(before)
+})
+
+test('a failed keeper call is retried at the next turn end with the same messages', async ($, on) => {
+  const { chat, keeperPrompts } = mockConversation(on, ['SAME'], [])
+  mock.store(on)
+  on('turn.complete', () => ({ text: 'done' }))
+  await startKeeperList($)
+  act(chat, 'first ask', 'ok', [])
+
+  await $.turn.complete(TURN_DONE)
+  await $.turn.complete(TURN_DONE)
+
+  expect(keeperPrompts).toHaveLength(2)
+  expect(keeperPrompts[1]).toContain('user: first ask')
+})
+
+test('a long keeper excerpt keeps the newest messages', async ($, on) => {
+  const { chat, keeperPrompts } = mockConversation(on, ['SAME'], ['{}'])
+  mock.store(on)
+  on('turn.complete', () => ({ text: 'done' }))
+  await startKeeperList($)
+  for (let i = 0; i < 25; i += 1) act(chat, `${i}`.padEnd(600, '.'), 'ok', [])
+
+  await $.turn.complete(TURN_DONE)
+
+  expect(keeperPrompts[0]).toContain('user: 24.')
+  expect(keeperPrompts[0]).not.toContain('user: 0.')
+})
+
+test('a keeper reply for a list the agent rewrote meanwhile is dropped', async ($, on) => {
+  const chat: Conversation = { turns: 0, messages: [] }
+  mock.store(on)
+  on('session.cwd', () => ({ value: '/repo' }))
+  on('session.id', () => ({ value: 'session-1' }))
+  on('session.turns', () => ({ value: chat.turns }))
+  on('session.messages', () => ({ value: [...chat.messages] }))
+  on('agent.list', () => ({ value: [] }))
+  on('turn.complete', () => ({ text: 'done' }))
+  on('model.complete', async (_, e) => {
+    if (!e.prompt.startsWith('Todo list:')) return { value: { isAnswered: true, text: 'SAME', usage: USAGE } }
+    await $.tool.call({ tool: SET_TODOS, todos: [{ content: 'New plan', status: 'pending' }] })
+    return { value: { isAnswered: true, text: '{"1": "completed"}', usage: USAGE } }
+  })
+  await startKeeperList($)
+  act(chat, 'a', 'b', [])
+
+  await $.turn.complete(TURN_DONE)
+  const ui = await mountSidebar($, 'terminal')
+
+  expect((await drawnRows(ui)).slice(-1)).toEqual(['○ New plan'])
+})
+
+test('statusKeeper false turns the keeper off', { options: { statusKeeper: false } }, async ($, on) => {
+  const { chat, keeperPrompts } = mockConversation(on, ['SAME'], ['{"2": "completed"}'])
+  mock.store(on)
+  on('turn.complete', () => ({ text: 'done' }))
+  await startKeeperList($)
+  act(chat, 'a', 'b', [])
+
+  await $.turn.complete(TURN_DONE)
+
+  expect(keeperPrompts).toHaveLength(0)
+})
+
+test('a resumed session keeps the keeper from reading messages it already checked', async ($, on) => {
+  answerSessionStart(on)
+  const { chat, keeperPrompts } = mockConversation(on, ['SAME'], ['{}'])
+  act(chat, 'old question', 'old answer', [])
+  mock.store(on, {
+    'session:session-1': {
+      title: 'Restored',
+      todos: [{ content: 'Do it', status: 'in_progress', activeForm: 'Doing it', isForUser: false }],
+      summary: { bullets: ['Did it'], coveredMessages: 2, checkedAtTurn: 1 },
+      keeperCoveredMessages: 2,
+    },
+  })
+  on('turn.complete', () => ({ text: 'done' }))
+
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  act(chat, 'new question', 'new answer', [])
+  await $.turn.complete(TURN_DONE)
+
+  expect(keeperPrompts).toHaveLength(1)
+  expect(keeperPrompts[0]).not.toContain('old question')
+  expect(keeperPrompts[0]).toContain('user: new question')
 })

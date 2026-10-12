@@ -57,10 +57,17 @@ function collectRows(node: unknown, rows: string[]): void {
   for (const child of node.children ?? []) collectRows(child, rows)
 }
 
-async function drawnRows(ui: SidebarMount): Promise<string[]> {
+const PLAN_BAR_ROW = /^[█░]+ \d+\/\d+ · \d+%$/
+
+async function allDrawnRows(ui: SidebarMount): Promise<string[]> {
   const rows: string[] = []
   collectRows((await ui.drawn()) as RenderElement, rows)
   return rows
+}
+
+// The plan bar has its own tests; leaving it out keeps the other tests about the rows they check.
+async function drawnRows(ui: SidebarMount): Promise<string[]> {
+  return (await allDrawnRows(ui)).filter(row => !PLAN_BAR_ROW.test(row))
 }
 
 function mockSession(on: On): void {
@@ -422,7 +429,7 @@ test('a start with todos already in state does not overwrite them from the store
   expect((await drawnRows(ui))[0]).toBe('Live')
 })
 
-test('rows are drawn without gray dimming, only the activity bar is dim', { options: { showActivityLog: true } }, async ($, on) => {
+test('todo rows are drawn without gray dimming, only the activity bar and plan label are dim', { options: { showActivityLog: true } }, async ($, on) => {
   mockSession(on)
   mock.store(on)
   answerFileTools(on)
@@ -432,7 +439,7 @@ test('rows are drawn without gray dimming, only the activity bar is dim', { opti
 
   const texts = await ui.findAll({ type: 'Text' })
   const dimmed = texts.filter(element => element.props.dimColor === true).map(element => element.text)
-  expect(dimmed).toEqual(['│'])
+  expect(dimmed).toEqual(['│', '1/3 · 33%'])
 })
 
 test('the half-filled parent mark is yellow and a single-step todo keeps the plain circle', async ($, on) => {
@@ -629,7 +636,7 @@ test('when rows run short the agent rows stay and the activity log shrinks', { o
     plugin: 'todo-sidebar',
     surface: 'terminal',
     component: 'Pane',
-    props: { ...PANE_PROPS, scroll: { offset: 0, bodyRows: 14 } },
+    props: { ...PANE_PROPS, scroll: { offset: 0, bodyRows: 16 } },
     requestId: 'todo-sidebar',
   })
   const rows = await drawnRows(ui)
@@ -1205,9 +1212,48 @@ test('a todo that wraps onto more lines leaves fewer lines for the activity log'
     plugin: 'todo-sidebar',
     surface: 'terminal',
     component: 'Pane',
-    props: { ...PANE_PROPS, scroll: { offset: 0, bodyRows: 9 } },
+    props: { ...PANE_PROPS, scroll: { offset: 0, bodyRows: 11 } },
     requestId: 'todo-sidebar',
   })
 
   expect((await drawnRows(ui)).filter(row => row.startsWith('│'))).toEqual(['│ Read b.ts', '│ Read c.ts'])
+})
+
+test('the plan bar sits between the todo list and the agents and counts only top-level rows', async ($, on) => {
+  mockSession(on)
+  mock.store(on)
+  mockAgents(on, ['a1'])
+  const finishedParent = { ...PARENT_WITH_SUBTASKS, subtasks: PARENT_WITH_SUBTASKS.subtasks.map(step => ({ ...step, status: 'completed' })) }
+  await $.tool.call({ tool: SET_TODOS, todos: [TODOS[0], finishedParent, PARENT_WITH_SUBTASKS, TODOS[2]] })
+  await $.agent.spawn(SPAWN)
+  const ui = await mountSidebar($, 'terminal')
+
+  const rows = await allDrawnRows(ui)
+  const barIndex = rows.findIndex(row => PLAN_BAR_ROW.test(row))
+  expect(rows[barIndex]).toBe('████████████░░░░░░░░░░░░ 2/4 · 50%')
+  expect(rows[barIndex - 1]).toBe('○ Ship it')
+  expect(rows[barIndex + 1]).toBe('Agents')
+})
+
+test('no plan bar while the todo list is empty', async ($, on) => {
+  mockSession(on)
+  mock.store(on)
+  mockAgents(on, ['a1'])
+  await $.agent.spawn(SPAWN)
+  const ui = await mountSidebar($, 'terminal')
+
+  expect((await allDrawnRows(ui)).some(row => PLAN_BAR_ROW.test(row))).toBe(false)
+})
+
+test('the desktop draws the plan bar as one drawing above the agent drawings', async ($, on) => {
+  mockSession(on)
+  mock.store(on)
+  mockAgents(on, ['a1'])
+  await $.tool.call({ tool: SET_TODOS, todos: [...TODOS] })
+  await $.agent.spawn(SPAWN)
+  const ui = await mountSidebar($, 'desktop')
+
+  const drawings = await ui.findAll({ type: 'Svg' })
+  expect(drawings).toHaveLength(3)
+  expect(drawings[0]?.props.alt).toBe('Plan 1/3 · 33%')
 })

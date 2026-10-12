@@ -41,6 +41,12 @@ Implement OAuth scopes
   reply it garbles changes nothing. When the agent rewrites the list while the model is still
   thinking, the answer is dropped. Set `statusKeeper` to false in the plugin config to turn it off;
   `summaryModel` picks the model for both.
+- Draws a progress bar for the whole plan just above **Agents**: finished top-level rows out of all
+  rows, with the percent, counted the way
+  [savvy-progress](https://github.com/JohnnyVizz/claude-kit/tree/main/plugins/savvy-progress)
+  counts accepted tasks. A parent counts as finished once all its subtasks are, and subtasks are not
+  counted on their own. The bar turns green when the plan is done and is hidden while the list is
+  empty.
 - Lists the session's subagents under **Agents**, in the style of
   [savvy-progress](https://github.com/JohnnyVizz/claude-kit/tree/main/plugins/savvy-progress):
   running agents first, finished ones behind a `▸ Finished` toggle. Each row shows the agent's type
@@ -103,7 +109,8 @@ In an interactive session the folder is watched: saving a file reloads the plugi
 - `hooks/agent-section.tsx` – the Agents section of the pane, terminal and desktop
 - `hooks/agent-drawings.ts` – desktop SVG rows, adapted from savvy-progress (MIT)
 - `hooks/builder-heads.ts` – the pixel builder heads, one helmet per tier
-- `hooks/register.test.ts`, `hooks/agent-runs.test.ts`, `hooks/builder-heads.test.ts` – tests, run with `claude plugin test`
+- `hooks/plan-progress.tsx` – the plan progress bar, terminal text and desktop drawing
+- `hooks/register.test.ts`, `hooks/agent-runs.test.ts`, `hooks/builder-heads.test.ts`, `hooks/plan-progress.test.ts` – tests, run with `claude plugin test`
 - `types/index.d.ts` – the plugin's state contract
 
 ## License

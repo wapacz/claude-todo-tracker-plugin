@@ -44,7 +44,7 @@ import { BUILDER_CSS, builderHead } from './builder-heads'
 export const AGENT_ROW_HEIGHT = 66
 export const TOTALS_HEIGHT = 44
 
-const FONT = "-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-serif"
+export const FONT = "-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-serif"
 const TEXT_LEFT = 42
 
 const PANE_CSS = `<style>
@@ -54,7 +54,7 @@ const PANE_CSS = `<style>
 @media (prefers-reduced-motion: reduce){.live{animation:none}}
 </style>`
 
-function escapeXml(text: string): string {
+export function escapeXml(text: string): string {
   return text.replace(/[&<>"]/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[char] ?? char)
 }
 
@@ -86,7 +86,7 @@ function statusMark(x: number, y: number, run: AgentRun, color: string): string 
   return `<path d="M${x - 4} ${y - 4}l8 8M${x + 4} ${y - 4}l-8 8" stroke="#D0453F" stroke-width="1.8" stroke-linecap="round"/>`
 }
 
-function svg(width: number, height: number, body: string): string {
+export function svg(width: number, height: number, body: string): string {
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">${PANE_CSS}${BUILDER_CSS}${body}</svg>`
 }
 

@@ -11,6 +11,8 @@ import type {
 import type { SessionSummary, Step, TodoItem, TodoStatus, ToolActivity } from '../types'
 import { AgentSection, agentSectionLines } from './agent-section'
 import type { AgentSectionView } from './agent-section'
+import { PlanProgressBar, planProgressLines } from './plan-progress'
+import type { PlanProgressView } from './plan-progress'
 import { isRunning as isAgentRunning, withEndedRun, withModelRequest, withReportedSteps, withStartedRun } from './agent-runs'
 
 const PANE_ID = 'todo-sidebar'
@@ -796,12 +798,18 @@ export const register: Register = (on, options) => {
       onToggleFinished: () => void update($, isFinishedAgentsShown, isShown => !isShown),
     }
     const agentRows = agentSectionLines(agentView, wrappedLineCount)
+    const planView: PlanProgressView = {
+      progress: { done: countByStatus(list, 'completed'), total: list.length },
+      columns: width,
+      isDesktop: e.surface === 'desktop',
+    }
+    const planRows = planProgressLines(planView.progress)
     const summaryLines = digest.bullets.reduce((sum, bullet) => sum + wrappedLineCount(bullet, width - MARK_COLUMNS), 0)
     const summaryRows = digest.bullets.length === 0 ? 0 : summaryLines + 2
     const headingText = heading ?? (list.length === 0 ? 'No todos yet.' : summarize(list))
     const headingRows = wrappedLineCount(headingText, width)
     const activityLines = (row: ToolActivity) => wrappedLineCount(row.target, width - MARK_COLUMNS - verbWidth - 1)
-    const activityRoom = Math.max(0, e.props.scroll.bodyRows - PANE_FIXED_ROWS - headingRows - summaryRows - todoRows - agentRows)
+    const activityRoom = Math.max(0, e.props.scroll.bodyRows - PANE_FIXED_ROWS - headingRows - summaryRows - todoRows - planRows - agentRows)
     const shownActivity = newestThatFit(activity, activityLines, activityRoom)
 
     return (
@@ -837,6 +845,7 @@ export const register: Register = (on, options) => {
             ))}
           </Box>
         )}
+        {PlanProgressBar(ui, planView)}
         {AgentSection(ui, agentView)}
       </Box>
     )

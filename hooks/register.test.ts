@@ -6,7 +6,7 @@ type SidebarMount = Mounted<RenderSurface, 'Pane'>
 
 const SURFACES = ['terminal', 'desktop'] as const
 const PANE_PROPS = {
-  title: 'Todos',
+  title: 'Summary',
   isFocused: false,
   bodyColumns: 40,
   placement: 'dock',
@@ -93,7 +93,6 @@ function mockConversation(on: On, replies: readonly string[], keeperReplies: rea
   on('session.id', () => ({ value: 'session-1' }))
   on('session.turns', () => ({ value: chat.turns }))
   on('session.messages', () => ({ value: [...chat.messages] }))
-  on('agent.list', () => ({ value: [] }))
   on('model.complete', (_, e) => {
     models.push(e.model)
     const isKeeper = e.prompt.startsWith('Todo list:')
@@ -213,23 +212,26 @@ test('a successful TodoWrite still mirrors into the sidebar', async ($, on) => {
   expect(await drawnRows(ui)).toHaveLength(4)
 })
 
-test('/todos-demo fills the sidebar with the example task', async ($, on) => {
+test('session start opens the pane titled Summary and registers /summary', async ($, on) => {
   mockSession(on)
   mock.store(on)
-  on('ui.open', () => ({ value: { isPlaced: true } }))
-
-  const answer = await $.command.run({
-    command: 'todos-demo',
-    args: '',
-    origin: { kind: 'composer' },
-    presentation: { isFullscreen: true, columns: 160 },
+  on('session.start', () => ({ cwd: '/repo' }))
+  on('tool.register', (_, e) => ({ value: { tool: `mcp__todo-sidebar__${e.name}` } }))
+  const opened: unknown[] = []
+  const commands: string[] = []
+  on('ui.open', (_, e) => {
+    opened.push(e)
+    return { value: { isPlaced: true } }
   })
-  const ui = await mountSidebar($, 'terminal')
-  const rows = await drawnRows(ui)
+  on('command.register', (_, e) => {
+    commands.push(e.name)
+    return { value: { command: e.name } }
+  })
 
-  expect(answer?.text).toBe('Example list of 6 todos shown in the sidebar.')
-  expect(rows[0]).toBe('Implement OAuth scopes')
-  expect(rows).toHaveLength(14)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+
+  expect(opened).toContainEqual(expect.objectContaining({ id: 'todo-sidebar', title: 'Summary' }))
+  expect(commands).toEqual(['summary'])
 })
 
 const PARENT_WITH_SUBTASKS = {
@@ -315,6 +317,15 @@ test('a malformed subtask names its path in the denial', async ($, on) => {
 
 const TURN_DONE = { reason: 'answer', answer: 'done', durationMs: 1000, isAborted: false, turnId: 't1' } as const
 
+// The kit's lib is plain ES2023, which leaves the host's timers undeclared.
+const timers = globalThis as unknown as { setTimeout: (callback: (value: unknown) => void, ms: number) => void }
+
+// The summary and the keeper run in the background so a turn never waits for them; let them land.
+async function endTurn($: Engine): Promise<void> {
+  await $.turn.complete(TURN_DONE)
+  await new Promise(resolve => timers.setTimeout(resolve, 0))
+}
+
 test('the activity log clears when the turn completes', { options: { showActivityLog: true } }, async ($, on) => {
   mockSession(on)
   mock.store(on)
@@ -323,7 +334,7 @@ test('the activity log clears when the turn completes', { options: { showActivit
   await $.tool.call({ tool: SET_TODOS, todos: [...TODOS] })
   await $.tool.call({ tool: 'Read', file_path: '/repo/a.ts' })
 
-  await $.turn.complete(TURN_DONE)
+  await endTurn($)
   const ui = await mountSidebar($, 'terminal')
 
   expect((await drawnRows(ui)).some(row => row.startsWith('│'))).toBe(false)
@@ -463,12 +474,6 @@ const SPAWN = {
   fork: false,
 } as const
 
-const AGENT_LIST = [
-  { id: 'a1', name: 'reviewer', description: 'Review the auth module', type: 'code-reviewer', status: 'running' },
-  { id: 'a2', description: 'Find all callers of login()', type: 'Explore', status: 'waiting' },
-  { id: 'a3', name: 'docs', description: 'Write docs', type: 'general-purpose', status: 'completed' },
-] as const
-
 test('the activity log is off by default: tool calls draw no rows', async ($, on) => {
   mockSession(on)
   mock.store(on)
@@ -480,11 +485,19 @@ test('the activity log is off by default: tool calls draw no rows', async ($, on
   expect((await drawnRows(ui)).some(row => row.startsWith('│'))).toBe(false)
 })
 
-test('spawning an agent lists it under an Agents heading with its mark, label and type', async ($, on) => {
+const STEP = 'mcp__todo-sidebar__step'
+const EMPTY_BAR = '░'.repeat(12)
+
+function mockAgents(on: On, agentIds: readonly string[]): void {
+  const queue = [...agentIds]
+  on('agent.spawn', () => ({ model: 'claude-sonnet-5-5', agentId: queue.shift() ?? 'extra' }))
+  on('clock.now', () => ({ value: 1_000 }))
+}
+
+test('spawning an agent shows it running under Agents with its type, model and stats', async ($, on) => {
   mockSession(on)
   mock.store(on)
-  on('agent.spawn', () => ({ model: 'claude-sonnet-5-5', agentId: 'a1' }))
-  on('agent.list', () => ({ value: [...AGENT_LIST] }))
+  mockAgents(on, ['a1'])
   await $.tool.call({ tool: SET_TODOS, todos: [TODOS[1]] })
 
   await $.agent.spawn(SPAWN)
@@ -492,58 +505,120 @@ test('spawning an agent lists it under an Agents heading with its mark, label an
 
   expect((await drawnRows(ui)).slice(2)).toEqual([
     'Agents',
-    '○ reviewer… code-reviewer',
-    '◐ Find all callers of login() Explore waiting',
-    '✓ docs general-purpose',
+    '≈$0.00 · 0 tokens · 0:00',
+    '▣ Review the auth module ●',
+    '  code-reviewer · Sonnet 5.5',
+    `  ${EMPTY_BAR} ctx 0% · 0  ≈$0.00  0:00`,
   ])
 })
 
-test('agent marks are colored by status', async ($, on) => {
+test('a finished agent moves behind a collapsed Finished toggle that opens on press', async ($, on) => {
   mockSession(on)
   mock.store(on)
-  on('agent.spawn', () => ({ model: 'claude-sonnet-5-5', agentId: 'a1' }))
-  on('agent.list', () => ({ value: [...AGENT_LIST, { id: 'a4', description: 'Crashed', type: 'Explore', status: 'failed' }] }))
-
-  await $.agent.spawn(SPAWN)
-  const ui = await mountSidebar($, 'terminal')
-
-  const marks = (await ui.findAll({ type: 'Text' })).filter(element => ['○', '◐', '✓', '✗'].includes(element.text))
-  expect(marks.map(mark => mark.props.color)).toEqual([undefined, 'yellow', 'green', 'red'])
-})
-
-test('a finished agent stays one more turn and then drops from the list', async ($, on) => {
-  mockSession(on)
-  mock.store(on)
-  on('agent.spawn', () => ({ model: 'claude-sonnet-5-5', agentId: 'a3' }))
-  on('agent.list', () => ({ value: [AGENT_LIST[2]] }))
-  on('turn.complete', () => ({ text: 'done' }))
-  await $.agent.spawn(SPAWN)
-  const ui = await mountSidebar($, 'terminal')
-  expect(await drawnRows(ui)).toContain('✓ docs general-purpose')
-
-  await $.turn.complete(TURN_DONE)
-  expect(await drawnRows(ui)).not.toContain('✓ docs general-purpose')
-})
-
-test('a subagent finishing its turn refreshes the roster without ageing finished agents', async ($, on) => {
-  mockSession(on)
-  mock.store(on)
-  on('agent.spawn', () => ({ model: 'claude-sonnet-5-5', agentId: 'a3' }))
-  on('agent.list', () => ({ value: [AGENT_LIST[2]] }))
+  mockAgents(on, ['a1'])
   on('turn.complete', () => ({ text: 'done' }))
   await $.agent.spawn(SPAWN)
   const ui = await mountSidebar($, 'terminal')
 
-  await $.turn.complete({ ...TURN_DONE, agentId: 'a3' })
-  expect(await drawnRows(ui)).toContain('✓ docs general-purpose')
+  await $.turn.complete({ ...TURN_DONE, agentId: 'a1' })
+  expect(await drawnRows(ui)).toContain('▸ Finished · 1')
+  expect((await drawnRows(ui)).some(row => row.includes('Review the auth module'))).toBe(false)
+
+  await ui.press({ key: 'finished-agents' })
+  expect(await drawnRows(ui)).toContain('▾ Finished · 1')
+  expect(await drawnRows(ui)).toContain('▣ Review the auth module ✓')
 })
 
-test('when rows run short the agents block keeps its rows and the activity log shrinks', { options: { showActivityLog: true } }, async ($, on) => {
+test('a finished agent keeps its place across later main turns', async ($, on) => {
+  mockSession(on)
+  mock.store(on)
+  mockAgents(on, ['a1'])
+  on('turn.complete', () => ({ text: 'done' }))
+  await $.agent.spawn(SPAWN)
+  await $.turn.complete({ ...TURN_DONE, agentId: 'a1' })
+
+  await endTurn($)
+  await endTurn($)
+  const ui = await mountSidebar($, 'terminal')
+
+  expect(await drawnRows(ui)).toContain('▸ Finished · 1')
+})
+
+test('an agent that ends without an answer is marked failed in red', async ($, on) => {
+  mockSession(on)
+  mock.store(on)
+  mockAgents(on, ['a1'])
+  on('turn.complete', () => ({ text: 'done' }))
+  await $.agent.spawn(SPAWN)
+  await $.turn.complete({ ...TURN_DONE, agentId: 'a1', reason: 'error' } as unknown as typeof TURN_DONE)
+  const ui = await mountSidebar($, 'terminal')
+  await ui.press({ key: 'finished-agents' })
+
+  const rows = await drawnRows(ui)
+  expect(rows).toContain('▣ Review the auth module ✗')
+  expect(rows).toContain('  code-reviewer · Sonnet 5.5 · error')
+  const marks = (await ui.findAll({ type: 'Text' })).filter(element => element.text === '✗')
+  expect(marks.map(mark => mark.props.color)).toEqual(['red'])
+})
+
+test('a worker reporting steps fills its bar and shows the step it is on', async ($, on) => {
+  mockSession(on)
+  mock.store(on)
+  mockAgents(on, ['a1'])
+  await $.agent.spawn(SPAWN)
+
+  const answer = await $.tool.call({ tool: STEP, done: 2, total: 5, note: 'writing tests', agentId: 'a1' })
+  const ui = await mountSidebar($, 'terminal')
+
+  expect(answer?.result).toBe('ok')
+  expect(await drawnRows(ui)).toContain(`  ${'█'.repeat(5)}${'░'.repeat(7)} 2/5 · writing tests · ctx 0% · 0  ≈$0.00  0:00`)
+})
+
+test('step calls from the main thread are ignored', async ($, on) => {
+  mockSession(on)
+  mock.store(on)
+  mockAgents(on, ['a1'])
+  await $.agent.spawn(SPAWN)
+
+  const answer = await $.tool.call({ tool: STEP, done: 1, total: 2 })
+  const ui = await mountSidebar($, 'terminal')
+
+  expect(answer?.result).toBe('Ignored: only subagents report steps.')
+  expect(await drawnRows(ui)).toContain(`  ${EMPTY_BAR} ctx 0% · 0  ≈$0.00  0:00`)
+})
+
+test('a task delegated again under the same description shows its round', async ($, on) => {
+  mockSession(on)
+  mock.store(on)
+  mockAgents(on, ['a1', 'a2'])
+  on('turn.complete', () => ({ text: 'done' }))
+  await $.agent.spawn(SPAWN)
+  await $.turn.complete({ ...TURN_DONE, agentId: 'a1' })
+
+  await $.agent.spawn({ ...SPAWN, tool_use_id: 'spawn-2' })
+  const ui = await mountSidebar($, 'terminal')
+
+  expect(await drawnRows(ui)).toContain('  code-reviewer · Sonnet 5.5 · round 2')
+})
+
+test('the desktop draws each agent as a builder row and the totals as tiles', async ($, on) => {
+  mockSession(on)
+  mock.store(on)
+  mockAgents(on, ['a1'])
+  await $.agent.spawn({ ...SPAWN, subagentType: 'savvy-careful' })
+  const ui = await mountSidebar($, 'desktop')
+
+  const drawings = await ui.findAll({ type: 'Svg' })
+  expect(drawings).toHaveLength(2)
+  expect(String(drawings[1]?.props.alt)).toContain('Review the auth module: careful · Sonnet 5.5, running')
+  expect(String(drawings[1]?.props.source)).toContain('class="c-careful run"')
+})
+
+test('when rows run short the agent rows stay and the activity log shrinks', { options: { showActivityLog: true } }, async ($, on) => {
   mockSession(on)
   mock.store(on)
   answerFileTools(on)
-  on('agent.spawn', () => ({ model: 'claude-sonnet-5-5', agentId: 'a1' }))
-  on('agent.list', () => ({ value: [...AGENT_LIST] }))
+  mockAgents(on, ['a1'])
   await $.tool.call({ tool: SET_TODOS, todos: [TODOS[1]] })
   await $.agent.spawn(SPAWN)
   await $.tool.call({ tool: 'Read', file_path: '/repo/a.ts' })
@@ -554,13 +629,13 @@ test('when rows run short the agents block keeps its rows and the activity log s
     plugin: 'todo-sidebar',
     surface: 'terminal',
     component: 'Pane',
-    props: { ...PANE_PROPS, scroll: { offset: 0, bodyRows: 13 } },
+    props: { ...PANE_PROPS, scroll: { offset: 0, bodyRows: 14 } },
     requestId: 'todo-sidebar',
   })
   const rows = await drawnRows(ui)
 
   expect(rows.filter(row => row.startsWith('│'))).toEqual(['│ Read b.ts', '│ Read c.ts'])
-  expect(rows.filter(row => row.includes('code-reviewer') || row.includes('Explore') || row.includes('general-purpose'))).toHaveLength(3)
+  expect(rows).toContain('▣ Review the auth module ●')
 })
 
 const FINISHED_PARENT = {
@@ -742,7 +817,7 @@ test('the first turn end asks the summary model and draws its bullet above the t
   await $.tool.call({ tool: SET_TODOS, title: 'Sidebar', todos: [TODOS[0]] })
   say(chat, 'create a sidebar plugin', 'Done, the pane is live.')
 
-  await $.turn.complete(TURN_DONE)
+  await endTurn($)
   const ui = await mountSidebar($, 'terminal')
 
   expect((await drawnRows(ui)).slice(0, 3)).toEqual(['Summary', '· Built the todo sidebar plugin', 'Sidebar'])
@@ -757,7 +832,7 @@ test('the transcript excerpt collapses whitespace, skips empty messages and cuts
   say(chat, 'line one\n\n   line two', '   ')
   say(chat, 'x'.repeat(700), 'ok')
 
-  await $.turn.complete(TURN_DONE)
+  await endTurn($)
 
   const excerpt = prompts[0]?.split('New messages:\n')[1]
   expect(excerpt).toBe(`user: line one line two\nuser: ${'x'.repeat(600)}\nassistant: ok`)
@@ -769,7 +844,7 @@ test('the transcript excerpt stops before it outgrows its character budget', asy
   on('turn.complete', () => ({ text: 'done' }))
   for (let i = 0; i < 25; i += 1) say(chat, `${i}`.padEnd(600, '.'), 'ok')
 
-  await $.turn.complete(TURN_DONE)
+  await endTurn($)
 
   const excerpt = prompts[0]?.split('New messages:\n')[1] ?? ''
   expect(excerpt.length).toBeLessThanOrEqual(12000)
@@ -784,21 +859,21 @@ test('the model is asked again only after six more prompts, and SAME keeps the b
   const ui = await mountSidebar($, 'terminal')
 
   say(chat, 'a', 'b')
-  await $.turn.complete(TURN_DONE)
+  await endTurn($)
   for (let i = 0; i < 5; i += 1) {
     say(chat, 'more', 'ok')
-    await $.turn.complete(TURN_DONE)
+    await endTurn($)
   }
   expect(prompts).toHaveLength(1)
 
   say(chat, 'seventh', 'ok')
-  await $.turn.complete(TURN_DONE)
+  await endTurn($)
   expect(prompts).toHaveLength(2)
   expect(prompts[1]).not.toContain('user: a')
   expect((await drawnRows(ui)).slice(0, 2)).toEqual(['Summary', '· Built the sidebar'])
 
   for (let i = 0; i < 6; i += 1) say(chat, 'publish it', 'pushed')
-  await $.turn.complete(TURN_DONE)
+  await endTurn($)
   expect((await drawnRows(ui)).slice(1, 3)).toEqual(['· Built the sidebar', '· Moved on to publishing'])
 })
 
@@ -810,7 +885,7 @@ test('the summary keeps at most three bullets, oldest first to go', async ($, on
 
   for (let round = 0; round < 4; round += 1) {
     for (let i = 0; i < 6; i += 1) say(chat, 'x', 'y')
-    await $.turn.complete(TURN_DONE)
+    await endTurn($)
   }
 
   expect((await drawnRows(ui)).slice(0, 4)).toEqual(['Summary', '· Two', '· Three', '· Four'])
@@ -822,8 +897,8 @@ test('a failed model call leaves the summary alone and is retried at the next tu
   on('turn.complete', () => ({ text: 'done' }))
   say(chat, 'a', 'b')
 
-  await $.turn.complete(TURN_DONE)
-  await $.turn.complete(TURN_DONE)
+  await endTurn($)
+  await endTurn($)
   const ui = await mountSidebar($, 'terminal')
 
   expect(prompts).toHaveLength(2)
@@ -847,7 +922,7 @@ test('summaryEveryPrompts 0 turns the summary off', { options: { summaryEveryPro
   on('turn.complete', () => ({ text: 'done' }))
   say(chat, 'a', 'b')
 
-  await $.turn.complete(TURN_DONE)
+  await endTurn($)
 
   expect(prompts).toHaveLength(0)
 })
@@ -858,7 +933,7 @@ test('the summary model comes from the summaryModel option', { options: { summar
   on('turn.complete', () => ({ text: 'done' }))
   say(chat, 'a', 'b')
 
-  await $.turn.complete(TURN_DONE)
+  await endTurn($)
 
   expect(models).toEqual(['claude-sonnet-5-5'])
 })
@@ -894,7 +969,7 @@ test('markdown markers are stripped from titles, rows and summary bullets', asyn
     ],
   })
   say(chat, 'a', 'b')
-  await $.turn.complete(TURN_DONE)
+  await endTurn($)
   const ui = await mountSidebar($, 'terminal')
 
   expect(await drawnRows(ui)).toEqual([
@@ -940,7 +1015,7 @@ test('a turn without set_todos asks the keeper, who sees the numbered list and t
   await startKeeperList($)
   act(chat, 'finish the renderer', 'Renderer done, publishing next.', [edited('src/render.ts')])
 
-  await $.turn.complete(TURN_DONE)
+  await endTurn($)
   const ui = await mountSidebar($, 'terminal')
 
   expect(keeperPrompts).toHaveLength(1)
@@ -963,7 +1038,7 @@ test('the keeper can tick off a user step once the user says it is done', async 
   await startKeeperList($)
   act(chat, 'ok, release approved', 'Thanks.', [])
 
-  await $.turn.complete(TURN_DONE)
+  await endTurn($)
   const ui = await mountSidebar($, 'terminal')
 
   expect((await drawnRows(ui))).toContain('    ✓ Approve the release')
@@ -975,11 +1050,11 @@ test('a turn in which the agent wrote the list itself is skipped and not read ag
   on('turn.complete', () => ({ text: 'done' }))
   await startKeeperList($)
   act(chat, 'go', 'Planned it.', [{ tool_use_id: 's1', tool: SET_TODOS, input: {} }])
-  await $.turn.complete(TURN_DONE)
+  await endTurn($)
   expect(keeperPrompts).toHaveLength(0)
 
   act(chat, 'next', 'Working on it.', [])
-  await $.turn.complete(TURN_DONE)
+  await endTurn($)
 
   expect(keeperPrompts).toHaveLength(1)
   expect(keeperPrompts[0]).not.toContain('Planned it.')
@@ -992,7 +1067,7 @@ test('the keeper stays quiet while the list is empty', async ($, on) => {
   on('turn.complete', () => ({ text: 'done' }))
   act(chat, 'hi', 'hello', [])
 
-  await $.turn.complete(TURN_DONE)
+  await endTurn($)
 
   expect(keeperPrompts).toHaveLength(0)
 })
@@ -1007,9 +1082,9 @@ test('a garbled keeper reply, unknown step numbers and unknown statuses change n
   const before = await drawnRows(ui)
 
   act(chat, 'a', 'b', [])
-  await $.turn.complete(TURN_DONE)
+  await endTurn($)
   act(chat, 'c', 'd', [])
-  await $.turn.complete(TURN_DONE)
+  await endTurn($)
 
   expect(keeperPrompts).toHaveLength(2)
   expect(await drawnRows(ui)).toEqual(before)
@@ -1022,8 +1097,8 @@ test('a failed keeper call is retried at the next turn end with the same message
   await startKeeperList($)
   act(chat, 'first ask', 'ok', [])
 
-  await $.turn.complete(TURN_DONE)
-  await $.turn.complete(TURN_DONE)
+  await endTurn($)
+  await endTurn($)
 
   expect(keeperPrompts).toHaveLength(2)
   expect(keeperPrompts[1]).toContain('user: first ask')
@@ -1036,7 +1111,7 @@ test('a long keeper excerpt keeps the newest messages', async ($, on) => {
   await startKeeperList($)
   for (let i = 0; i < 25; i += 1) act(chat, `${i}`.padEnd(600, '.'), 'ok', [])
 
-  await $.turn.complete(TURN_DONE)
+  await endTurn($)
 
   expect(keeperPrompts[0]).toContain('user: 24.')
   expect(keeperPrompts[0]).not.toContain('user: 0.')
@@ -1049,7 +1124,6 @@ test('a keeper reply for a list the agent rewrote meanwhile is dropped', async (
   on('session.id', () => ({ value: 'session-1' }))
   on('session.turns', () => ({ value: chat.turns }))
   on('session.messages', () => ({ value: [...chat.messages] }))
-  on('agent.list', () => ({ value: [] }))
   on('turn.complete', () => ({ text: 'done' }))
   on('model.complete', async (_, e) => {
     if (!e.prompt.startsWith('Todo list:')) return { value: { isAnswered: true, text: 'SAME', usage: USAGE } }
@@ -1059,7 +1133,7 @@ test('a keeper reply for a list the agent rewrote meanwhile is dropped', async (
   await startKeeperList($)
   act(chat, 'a', 'b', [])
 
-  await $.turn.complete(TURN_DONE)
+  await endTurn($)
   const ui = await mountSidebar($, 'terminal')
 
   expect((await drawnRows(ui)).slice(-1)).toEqual(['○ New plan'])
@@ -1072,7 +1146,7 @@ test('statusKeeper false turns the keeper off', { options: { statusKeeper: false
   await startKeeperList($)
   act(chat, 'a', 'b', [])
 
-  await $.turn.complete(TURN_DONE)
+  await endTurn($)
 
   expect(keeperPrompts).toHaveLength(0)
 })
@@ -1093,7 +1167,7 @@ test('a resumed session keeps the keeper from reading messages it already checke
 
   await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
   act(chat, 'new question', 'new answer', [])
-  await $.turn.complete(TURN_DONE)
+  await endTurn($)
 
   expect(keeperPrompts).toHaveLength(1)
   expect(keeperPrompts[0]).not.toContain('old question')
@@ -1105,8 +1179,7 @@ const LONG_STEP = 'Migrated every preprocessing job definition to the new pipeli
 test('long todo and agent texts wrap instead of being cut off', async ($, on) => {
   mockSession(on)
   mock.store(on)
-  on('agent.spawn', () => ({ model: 'claude-sonnet-5-5', agentId: 'a1' }))
-  on('agent.list', () => ({ value: [...AGENT_LIST] }))
+  mockAgents(on, ['a1'])
   await $.tool.call({ tool: SET_TODOS, todos: [{ content: LONG_STEP, status: 'completed', activeForm: 'Migrating' }] })
   await $.agent.spawn(SPAWN)
 

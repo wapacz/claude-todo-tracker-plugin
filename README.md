@@ -41,6 +41,17 @@ Implement OAuth scopes
   reply it garbles changes nothing. When the agent rewrites the list while the model is still
   thinking, the answer is dropped. Set `statusKeeper` to false in the plugin config to turn it off;
   `summaryModel` picks the model for both.
+- Lists the session's subagents under **Agents**, in the style of
+  [savvy-progress](https://github.com/JohnnyVizz/claude-kit/tree/main/plugins/savvy-progress):
+  running agents first, finished ones behind a `▸ Finished` toggle. Each row shows the agent's type
+  (or savvy tier), model and effort, the round when a task is delegated again, a progress bar, the
+  context fill, tokens, an estimated cost and the elapsed time; a header sums cost, tokens and time.
+  On the desktop app each row is drawn with a pixel builder whose helmet shows the tier (foreman,
+  welder, ear defenders, hard hat, bump cap, headlamp); the head nods and the helmet's prop moves
+  while the agent runs. The terminal draws the same rows in text. Cost is an estimate from token counts and
+  the price table in `hooks/agent-runs.ts`, not a bill.
+- Gives subagents a `step` tool to report their own progress (`done`, `total`, `note`). A subagent
+  that does not report shows its context fill in grey instead.
 - Saves the list per session and restores it when the session is resumed.
 - Keeps a finished row's subtasks when a later call resends the row without them, matched by the
   same text or the same position in a list of the same length, so finished detail is not lost to a
@@ -50,8 +61,7 @@ Implement OAuth scopes
 
 | Command | Effect |
 | --- | --- |
-| `/todos` | Open the pane if you closed it |
-| `/todos-demo` | Fill the pane with the example above |
+| `/summary` | Open the Summary pane if you closed it |
 
 ## Install
 
@@ -72,7 +82,7 @@ claude --plugin-dir /absolute/path/to/claude-todo-tracker-plugin
 ```
 
 The pane docks on the right in the fullscreen terminal layout at 110 columns or more. It opens on
-its own from 144 columns; below that, run `/todos`. In narrower terminals it sits inline above the
+its own from 144 columns; below that, run `/summary`. In narrower terminals it sits inline above the
 prompt.
 
 ## Develop
@@ -88,10 +98,18 @@ In an interactive session the folder is watched: saving a file reloads the plugi
 
 - `.claude-plugin/plugin.json` – manifest
 - `hooks/hooks.json` – names the hooks module
-- `hooks/register.tsx` – the plugin: commands, the `set_todos` tool, the activity log, the pane
-- `hooks/register.test.ts` – tests, run with `claude plugin test`
+- `hooks/register.tsx` – the plugin: commands, the `set_todos` and `step` tools, the activity log, the pane
+- `hooks/agent-runs.ts` – agent runs: tokens, cost estimate, steps, rounds, formatting
+- `hooks/agent-section.tsx` – the Agents section of the pane, terminal and desktop
+- `hooks/agent-drawings.ts` – desktop SVG rows, adapted from savvy-progress (MIT)
+- `hooks/builder-heads.ts` – the pixel builder heads, one helmet per tier
+- `hooks/register.test.ts`, `hooks/agent-runs.test.ts`, `hooks/builder-heads.test.ts` – tests, run with `claude plugin test`
 - `types/index.d.ts` – the plugin's state contract
 
 ## License
 
 MIT
+
+`hooks/agent-drawings.ts` is adapted from
+[savvy-progress](https://github.com/johnnyvizz/claude-kit/tree/main/plugins/savvy-progress),
+MIT License, Copyright (c) 2026 johnnyvizz; the full notice is at the top of that file.

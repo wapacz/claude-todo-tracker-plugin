@@ -24,12 +24,27 @@ export type SessionSummary = {
   checkedAtTurn: number
 }
 
-export type AgentRow = {
+export type AgentRunStatus = 'running' | 'done' | 'failed'
+
+export type AgentRun = {
   id: string
-  label: string
+  agentId?: string
   type: string
-  status: 'pending' | 'running' | 'waiting' | 'idle' | 'completed' | 'failed' | 'killed'
-  turnsSinceEnd: number
+  description: string
+  model: string
+  effort?: string
+  status: AgentRunStatus
+  startedAt: number
+  endedAt?: number
+  contextTokens: number
+  contextMax: number
+  tokens: number
+  costUsd: number
+  modelRequests: number
+  round: number
+  stepsDone?: number
+  stepsTotal?: number
+  stepNote?: string
 }
 
 declare module 'claude-code' {
@@ -38,7 +53,9 @@ declare module 'claude-code' {
       todos: TodoItem[]
       title: string | null
       toolActivity: ToolActivity[]
-      agents: AgentRow[]
+      agentRuns: AgentRun[]
+      isFinishedAgentsShown: boolean
+      now: number
       expandedParents: string[]
       summary: SessionSummary
       keeperCoveredMessages: number

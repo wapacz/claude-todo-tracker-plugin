@@ -1,6 +1,5 @@
 import { atom, read, update } from 'claude-code'
 import type {
-  AgentInfo,
   EngineInterface,
   Register,
   SessionMessage,
@@ -9,18 +8,22 @@ import type {
   ToolUseSummary,
 } from 'claude-code'
 
-import type { AgentRow, SessionSummary, Step, TodoItem, TodoStatus, ToolActivity } from '../types'
+import type { SessionSummary, Step, TodoItem, TodoStatus, ToolActivity } from '../types'
+import { AgentSection, agentSectionLines } from './agent-section'
+import type { AgentSectionView } from './agent-section'
+import { isRunning as isAgentRunning, withEndedRun, withModelRequest, withReportedSteps, withStartedRun } from './agent-runs'
 
 const PANE_ID = 'todo-sidebar'
-const PANE_TITLE = 'Todos'
-const OPEN_COMMAND = 'todos'
-const DEMO_COMMAND = 'todos-demo'
+const PANE_TITLE = 'Summary'
+const OPEN_COMMAND = 'summary'
 const SET_TODOS_TOOL = 'set_todos'
+const STEP_TOOL = 'step'
+const STEP_TOOL_ID = 'mcp__todo-sidebar__step'
+const CLOCK_TICK_MS = 1000
 const ACTIVITY_ROWS = 6
 const BASH_TARGET_LENGTH = 32
 const SUBTASK_INDENT = 4
 const KEPT_SESSIONS = 20
-const ENDED_AGENT_TURNS_SHOWN = 1
 const PANE_FIXED_ROWS = 3
 const PANE_PADDING_X = 1
 const MARK_COLUMNS = 2
@@ -37,7 +40,9 @@ const TODO_WRITERS = new Set([SET_TODOS_TOOL_ID, 'TodoWrite'])
 const todos = atom({ plugin: 'todo-sidebar', key: 'todos' } as const, [])
 const title = atom({ plugin: 'todo-sidebar', key: 'title' } as const, null)
 const toolActivity = atom({ plugin: 'todo-sidebar', key: 'toolActivity' } as const, [])
-const agents = atom({ plugin: 'todo-sidebar', key: 'agents' } as const, [])
+const agentRuns = atom({ plugin: 'todo-sidebar', key: 'agentRuns' } as const, [])
+const isFinishedAgentsShown = atom({ plugin: 'todo-sidebar', key: 'isFinishedAgentsShown' } as const, false)
+const now = atom({ plugin: 'todo-sidebar', key: 'now' } as const, 0)
 const expandedParents = atom({ plugin: 'todo-sidebar', key: 'expandedParents' } as const, [])
 const EMPTY_SUMMARY: SessionSummary = { bullets: [], coveredMessages: 0, checkedAtTurn: 0 }
 const summary = atom({ plugin: 'todo-sidebar', key: 'summary' } as const, EMPTY_SUMMARY)
@@ -45,37 +50,11 @@ const keeperCoveredMessages = atom({ plugin: 'todo-sidebar', key: 'keeperCovered
 
 const STATUSES: readonly TodoStatus[] = ['pending', 'in_progress', 'completed']
 
-const SILENT_TOOLS = new Set([...TODO_WRITERS, 'ToolSearch'])
+const SILENT_TOOLS = new Set([...TODO_WRITERS, STEP_TOOL_ID, 'ToolSearch'])
 
 const TOOL_VERB: Record<string, string> = {
   Bash: 'Run',
 }
-
-const DEMO_TITLE = 'Implement OAuth scopes'
-const DEMO_TODOS: TodoItem[] = [
-  { content: 'Added Google OAuth provider', status: 'completed', activeForm: 'Adding Google OAuth provider', isForUser: false },
-  { content: 'Updated callback handling', status: 'completed', activeForm: 'Updating callback handling', isForUser: false },
-  { content: 'Configured scope mapping', status: 'completed', activeForm: 'Configuring scope mapping', isForUser: false },
-  { content: 'Added tests for OAuth flow', status: 'completed', activeForm: 'Adding tests for OAuth flow', isForUser: false },
-  {
-    content: 'Update documentation',
-    status: 'in_progress',
-    activeForm: 'Updating documentation',
-    isForUser: false,
-    subtasks: [
-      { content: 'Wrote docs/oauth.md', status: 'completed', activeForm: 'Writing docs/oauth.md', isForUser: false },
-      { content: 'Add README section', status: 'in_progress', activeForm: 'Adding README section', isForUser: false },
-      { content: 'Link from CHANGELOG', status: 'pending', activeForm: 'Linking from CHANGELOG', isForUser: false },
-    ],
-  },
-  { content: 'Open pull request', status: 'pending', activeForm: 'Opening pull request', isForUser: true },
-]
-const DEMO_ACTIVITY: ToolActivity[] = [
-  { id: 'demo-1', verb: 'Read', target: 'auth.provider.ts', isDone: true },
-  { id: 'demo-2', verb: 'Edit', target: 'src/auth/oauth.ts (+42 -6)', isDone: true },
-  { id: 'demo-3', verb: 'Run', target: 'npm test', isDone: true },
-  { id: 'demo-4', verb: 'Write', target: 'docs/oauth.md', isDone: false },
-]
 
 const STEP_PROPERTIES = {
   content: {
@@ -117,6 +96,16 @@ const SET_TODOS_SCHEMA = {
         },
       },
     },
+  },
+}
+
+const STEP_SCHEMA = {
+  type: 'object',
+  required: ['done'],
+  properties: {
+    done: { type: 'integer', minimum: 0, description: 'Steps finished so far.' },
+    total: { type: 'integer', minimum: 1, description: 'Steps planned; may change if the plan changes.' },
+    note: { type: 'string', description: 'The step in progress, a few words.' },
   },
 }
 
@@ -230,53 +219,6 @@ function isRunning(mark: StepMark): boolean {
   return mark === 'in_progress' || mark === 'partial'
 }
 
-const ENDED_AGENT_STATUSES: ReadonlySet<AgentRow['status']> = new Set(['completed', 'failed', 'killed'])
-
-const AGENT_GLYPH: Record<AgentRow['status'], string> = {
-  pending: '○',
-  running: '○',
-  waiting: '◐',
-  idle: '◐',
-  completed: '✓',
-  failed: '✗',
-  killed: '✗',
-}
-
-const AGENT_COLOR: Record<AgentRow['status'], string | undefined> = {
-  pending: undefined,
-  running: undefined,
-  waiting: 'yellow',
-  idle: 'yellow',
-  completed: 'green',
-  failed: 'red',
-  killed: 'red',
-}
-
-function hasEnded(row: AgentRow): boolean {
-  return ENDED_AGENT_STATUSES.has(row.status)
-}
-
-function toAgentRow(info: AgentInfo, previous: readonly AgentRow[]): AgentRow {
-  const known = previous.find(row => row.id === info.id)
-  return {
-    id: info.id,
-    label: info.name ?? info.description,
-    type: info.type,
-    status: info.status,
-    turnsSinceEnd: known?.turnsSinceEnd ?? 0,
-  }
-}
-
-function agentRowsFrom(listed: readonly AgentInfo[], previous: readonly AgentRow[]): AgentRow[] {
-  return listed
-    .map(info => toAgentRow(info, previous))
-    .filter(row => !hasEnded(row) || row.turnsSinceEnd < ENDED_AGENT_TURNS_SHOWN)
-}
-
-function ageEndedAgents(rows: readonly AgentRow[]): AgentRow[] {
-  return rows.map(row => (hasEnded(row) ? { ...row, turnsSinceEnd: row.turnsSinceEnd + 1 } : row))
-}
-
 function canCollapse(item: TodoItem): boolean {
   return (item.subtasks?.length ?? 0) > 0 && effectiveStatus(item) === 'completed'
 }
@@ -293,16 +235,8 @@ function visibleSubtasks(item: TodoItem, expanded: readonly string[]): Step[] {
   return isExpanded(item, expanded) ? item.subtasks ?? [] : []
 }
 
-function agentStatusNote(row: AgentRow): string {
-  return row.status === 'running' || row.status === 'completed' ? '' : row.status
-}
-
 function stepText(step: Step, mark: StepMark): string {
   return isRunning(mark) ? `${step.activeForm}…` : step.content
-}
-
-function agentLabel(row: AgentRow): string {
-  return row.status === 'running' ? `${row.label}…` : row.label
 }
 
 function toggleLabel(item: TodoItem, expanded: readonly string[]): string {
@@ -586,9 +520,11 @@ async function persist($: EngineInterface): Promise<void> {
   await Promise.all(stale.map(key => $.store.delete(key)))
 }
 
-async function refreshAgents($: EngineInterface): Promise<void> {
-  const listed = await $.agent.list()
-  await update($, agents, previous => agentRowsFrom(listed, previous))
+async function tickRunningAgents($: EngineInterface): Promise<void> {
+  const runs = await read($, agentRuns)
+  if (!runs.some(isAgentRunning)) return
+  const at = await $.clock.now()
+  await update($, now, () => at)
 }
 
 async function restore($: EngineInterface): Promise<void> {
@@ -677,18 +613,26 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     await restore($)
     if (await isSummaryDue($, summaryPolicy)) refreshSummaryInBackground($, summaryPolicy)
-    await $.command.register({ name: OPEN_COMMAND, description: 'Open the todo sidebar' })
-    await $.command.register({ name: DEMO_COMMAND, description: 'Fill the todo sidebar with an example list' })
+    await $.command.register({ name: OPEN_COMMAND, description: 'Open the Summary pane' })
     await $.tool.register({
       name: SET_TODOS_TOOL,
       description:
-        'Replace the todo list shown in the Todos sidebar. The sidebar is written for the user, not for you: ' +
+        'Replace the todo list shown in the Summary pane. The pane is written for the user, not for you: ' +
         'they read it to see what has been done and what they must do next, so every item must make sense ' +
         'without the transcript, and items that need the user\'s action carry forUser: true. ' +
         'Call it whenever the plan changes: when you start a multi-step task (give a short title), ' +
         'start a step (in_progress) or finish one (completed).',
       inputSchema: SET_TODOS_SCHEMA,
     })
+    await $.tool.register({
+      name: STEP_TOOL,
+      description:
+        'For subagents: report progress on your own task to the Summary pane. ' +
+        'Right after reading your brief, call it with total (your plan in 3-8 steps) and done: 0; ' +
+        'call it again as each step finishes. Cheap and silent: it only draws a bar.',
+      inputSchema: STEP_SCHEMA,
+    })
+    $.clock.every(CLOCK_TICK_MS, () => void tickRunningAgents($).catch(() => undefined))
     void $.ui.open({ id: PANE_ID, title: PANE_TITLE })
 
     return next(e)
@@ -697,19 +641,10 @@ export const register: Register = (on, options) => {
   on('command.run', { command: OPEN_COMMAND }, async $ => {
     const opened = await $.ui.open({ id: PANE_ID, title: PANE_TITLE })
     const text = opened.isPlaced
-      ? 'Todo sidebar opened.'
-      : 'Todo sidebar will appear once the terminal is wide enough for a dock.'
+      ? 'Summary pane opened.'
+      : 'Summary pane will appear once the terminal is wide enough for a dock.'
 
     return { text }
-  })
-
-  on('command.run', { command: DEMO_COMMAND }, async $ => {
-    await update($, title, () => DEMO_TITLE)
-    await update($, todos, () => DEMO_TODOS)
-    await update($, toolActivity, () => DEMO_ACTIVITY)
-    await $.ui.open({ id: PANE_ID, title: PANE_TITLE })
-
-    return { text: `Example list of ${DEMO_TODOS.length} todos shown in the sidebar.` }
   })
 
   on('tool.call', { tool: SET_TODOS_TOOL_ID }, async ($, e) => {
@@ -746,20 +681,55 @@ export const register: Register = (on, options) => {
     const isMainThread = e.agentId === undefined
     if (isMainThread) {
       await update($, toolActivity, () => [])
-      await update($, agents, ageEndedAgents)
       if (await isSummaryDue($, summaryPolicy)) refreshSummaryInBackground($, summaryPolicy)
       if (keeperPolicy.isEnabled) keepStatusesInBackground($, keeperPolicy)
+      return next(e)
     }
-    await refreshAgents($)
+    const agentId = e.agentId
+    const at = await $.clock.now()
+    const ending = { isAnswered: e.reason === 'answer', at, usage: e.usage }
+    await update($, agentRuns, runs => withEndedRun(runs, agentId, ending))
+    await update($, now, () => at)
 
     return next(e)
   })
 
   on('agent.spawn', async ($, e, next) => {
     const started = await next(e)
-    await refreshAgents($)
+    if (started.deny !== undefined) return started
+    const at = await $.clock.now()
+    const spawned = {
+      id: started.agentId ?? e.tool_use_id,
+      agentId: started.agentId,
+      type: e.subagentType,
+      description: e.description,
+      model: started.model,
+    }
+    await update($, agentRuns, runs => withStartedRun(runs, spawned, at))
+    await update($, now, () => at)
 
     return started
+  })
+
+  // Each model request of a subagent carries its live context, tokens and cost.
+  on('turn.step', async function* ($, e, next) {
+    const response = yield* next(e)
+    const agentId = e.agentId
+    if (agentId === undefined || response.usage === null) return response
+    const request = { usage: response.usage, model: e.model, effort: e.effort }
+    await update($, agentRuns, runs => withModelRequest(runs, agentId, request))
+
+    return response
+  })
+
+  // The call runs in the worker's own loop, so its agentId names the reporting run.
+  on('tool.call', { tool: STEP_TOOL_ID }, async ($, e) => {
+    const agentId = e.agentId
+    if (agentId === undefined) return { result: 'Ignored: only subagents report steps.' }
+    const reported = { done: e.done, total: e.total, note: e.note }
+    await update($, agentRuns, runs => withReportedSteps(runs, agentId, reported))
+
+    return { result: 'ok' }
   })
 
   on('tool.call', async ($, e, next) => {
@@ -780,12 +750,15 @@ export const register: Register = (on, options) => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE_ID }, async ($, e) => {
-    const { Box, Text, Button } = $.ui.resolve(e)
-    const [list, heading, activity, roster, expanded, digest] = await Promise.all([
+    const ui = $.ui.resolve(e)
+    const { Box, Text, Button } = ui
+    const [list, heading, activity, runs, isFinishedShown, clock, expanded, digest] = await Promise.all([
       read($, todos),
       read($, title),
       read($, toolActivity),
-      read($, agents),
+      read($, agentRuns),
+      read($, isFinishedAgentsShown),
+      read($, now),
       read($, expandedParents),
       read($, summary),
     ])
@@ -814,12 +787,15 @@ export const register: Register = (on, options) => {
         visibleSubtasks(item, expanded).reduce((sum, step) => sum + stepLines(step, markOfStep(step, step.status), SUBTASK_INDENT), 0),
       0,
     )
-    const agentLines = (row: AgentRow) => {
-      const note = agentStatusNote(row)
-      const trailing = row.type.length + 1 + (note === '' ? 0 : note.length + 1)
-      return wrappedLineCount(agentLabel(row), width - MARK_COLUMNS - trailing)
+    const agentView: AgentSectionView = {
+      runs,
+      at: Math.max(clock, ...runs.map(run => run.startedAt), 0),
+      isFinishedShown,
+      columns: width,
+      isDesktop: e.surface === 'desktop',
+      onToggleFinished: () => void update($, isFinishedAgentsShown, isShown => !isShown),
     }
-    const agentRows = roster.length === 0 ? 0 : roster.reduce((sum, row) => sum + agentLines(row), 0) + 2
+    const agentRows = agentSectionLines(agentView, wrappedLineCount)
     const summaryLines = digest.bullets.reduce((sum, bullet) => sum + wrappedLineCount(bullet, width - MARK_COLUMNS), 0)
     const summaryRows = digest.bullets.length === 0 ? 0 : summaryLines + 2
     const headingText = heading ?? (list.length === 0 ? 'No todos yet.' : summarize(list))
@@ -861,19 +837,7 @@ export const register: Register = (on, options) => {
             ))}
           </Box>
         )}
-        {roster.length > 0 && (
-          <Box flexDirection="column">
-            <Text bold>Agents</Text>
-            {roster.map(row => (
-              <Box flexDirection="row" gap={1}>
-                <Text color={AGENT_COLOR[row.status]}>{AGENT_GLYPH[row.status]}</Text>
-                <Text wrap="wrap">{agentLabel(row)}</Text>
-                <Text>{row.type}</Text>
-                {agentStatusNote(row) !== '' && <Text>{agentStatusNote(row)}</Text>}
-              </Box>
-            ))}
-          </Box>
-        )}
+        {AgentSection(ui, agentView)}
       </Box>
     )
   })
